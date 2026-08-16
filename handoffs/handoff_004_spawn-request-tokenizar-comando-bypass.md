@@ -37,4 +37,4 @@
 ```
 git commit -m "fix: tokenizar command de spawn-requests (workers con flags morían con ENOENT en <1s) y heredar autoMode (bypass) en workers de god - Agente Claude-IMPLEMENTADOR - TESTED"
 ```
-Hash: [pendiente — se registra tras el commit]
+Hash: 441060f
