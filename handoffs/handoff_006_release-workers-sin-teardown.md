@@ -32,4 +32,4 @@
 ```
 git commit -m "fix: teardownPty explícito tras kill en release/reap de workers (kill() no dispara onExit; tarjetas quedaban congeladas y god maileaba agentes muertos) - Agente Claude-IMPLEMENTADOR - TESTED"
 ```
-Hash: [pendiente — se registra tras el commit]
+Hash: 9a1bc06
