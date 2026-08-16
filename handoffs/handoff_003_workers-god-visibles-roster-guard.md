@@ -39,4 +39,4 @@
 ```
 git commit -m "fix: workers contratados por god visibles en el piso y restaurables tras reinicio; guard del roster no se desarma tras un rechazo - Agente Claude-IMPLEMENTADOR - TESTED"
 ```
-Hash: [pendiente — se registra tras el commit]
+Hash: eb366b0
