@@ -15,10 +15,14 @@
 
 ## 🧪 TESTING Y VALIDACIÓN
 - Pruebas ejecutadas: `npm run typecheck` → sin errores; `npm run test:focused` → 131/131 pass. Validación runtime en el reinicio inmediato (este mismo turno): los agentes nuevos NO deben mostrar la advertencia y sus transcripts deben aparecer en `~/.claude/projects/<cwd-slug>/`.
-- Resultados obtenidos: EXITOSO (estático); runtime validado en este turno tras reinicio (ver respuesta al humano / próximo handoff si hay hallazgos).
-- Problemas encontrados: n/a nuevos.
-- Reparaciones realizadas: fix descrito.
-- Estado final: TESTS PASANDO — validación runtime en el reinicio de este mismo turno
+- Resultados obtenidos: EXITOSO (estático + runtime). Reinicio ejecutado ~00:10; validado:
+  1. Migración archivó huérfanos (marketing/business2/qa2) y el auto-restore revivió a los 4 (god, Ryan, David-business2, Angela-qa2) — verificado con `ps eww`: **child_marker=0 en todos** los procesos de agente.
+  2. **Transcripts en disco**: 3 `.jsonl` nuevos en `~/.claude/projects/-Users-gastonpechieu-Develop-Oficina-Neus/` a las 00:12-00:13 — primera vez que los agentes guardan sesión (resume funcional de aquí en más).
+  3. **0 errores del miner de memoria** en el log post-boot (fix handoff 005 activo).
+  4. Rescate de correo huérfano: los 2 mails sustantivos del inbox de worker-business v1 (QA de Oscar con 8 must-fix + decisiones del humano sobre roadmap/precio) reenviados al David vivo (`worker-business2`, subject prefijado "[reenviado de worker-business...]"); el 3º (budget) archivado por superado (corrección EUR4.700 de Ryan ya entregada a business2). Inbox del muerto a 0 pendientes.
+- Problemas encontrados: la tarjeta de worker-business v1 había sido eliminada del roster (por el humano), por eso su inbox quedó huérfano sin revive posible — el rescate manual fue la reparación.
+- Reparaciones realizadas: las descritas.
+- Estado final: FUNCIONANDO CORRECTAMENTE (queda 1 validación de ciclo largo: el próximo done de un worker efímero debe archivar tarjeta + liberar id — código de handoff 006 ya activo)
 
 ## ⚠️ PARA PRÓXIMO AGENTE
 - Este reinicio activa los fixes de handoffs 005 (mempalace cpu), 006 (teardown en release) y 007 (env). Checklist post-arranque:
