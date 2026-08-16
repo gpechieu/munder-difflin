@@ -33,4 +33,4 @@
 ```
 git commit -m "fix: limpiar markers de sesión Claude Code heredados en env de PTYs (transcripts se apagaban; resume imposible) - Agente Claude-IMPLEMENTADOR - TESTED"
 ```
-Hash: [pendiente — se registra tras el commit]
+Hash: a2eb617
