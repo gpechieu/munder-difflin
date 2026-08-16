@@ -36,4 +36,4 @@
 ```
 git commit -m "fix: resolver npm install (vite ^7.3.6 por peer de electron-vite 5; better-sqlite3 ^13 para Electron 43) - Agente Claude-IMPLEMENTADOR - TESTED"
 ```
-Hash: 51f765a
+Hash: d07a035
