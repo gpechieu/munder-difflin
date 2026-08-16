@@ -38,4 +38,4 @@
 ```
 git commit -m "fix: forzar MEMPALACE_EMBEDDING_DEVICE=cpu (CoreML produce NaN con embeddinggemma cuantizado; memoria semántica no se indexaba) - Agente Claude-IMPLEMENTADOR - TESTED"
 ```
-Hash: [pendiente — se registra tras el commit]
+Hash: c4258bc
