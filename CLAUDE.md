@@ -17,7 +17,7 @@ App Electron (electron-vite + React + better-sqlite3 + node-pty) que orquesta ag
 - `[roster] refused to overwrite...` en el log = el guard anti-borrado actuó. Desde 2026-08-16 el guard NO se desarma tras un rechazo (solo tras el primer write no-vacío) — test en `test/roster.test.cjs`.
 - El quit de la app NO pasa por `teardownPty` (los agentes quedan `archived:false` en registry); la migración `archiveOrphanedAgents` los archiva al siguiente boot. Es el flujo normal, no un bug.
 - Errores `trust_store_mac.cc: Error parsing certificate` en dev = ruido de Chromium/llavero macOS, ignorar.
-- `[memory] mine <id> exited 1 ... chromadb NaN embeddings` = bug pendiente del miner de mempalace (no tumba la app).
+- `[memory] mine <id> exited 1 ... chromadb NaN embeddings` = CoreML EP produce NaN con embeddinggemma cuantizado; RESUELTO 2026-08-16 forzando `MEMPALACE_EMBEDDING_DEVICE=cpu` en `memory.ts` (handoff 005). Si reaparece: verificar que el env llegue al miner y a los agentes. Para correr `mempalace` a mano: exportar `MEMPALACE_PALACE_PATH`, `MEMPALACE_EMBEDDING_MODEL=embeddinggemma` y `MEMPALACE_EMBEDDING_DEVICE=cpu`.
 - Los mensajes user↔agente van por `inbox/`/`outbox/` del agent dir con env `AGENT_ID`/`AGENT_DIR`/`HIVE_*` inyectado al PTY.
 
 ## Validación (proyecto = app de escritorio)
