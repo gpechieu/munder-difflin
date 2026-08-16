@@ -19,19 +19,19 @@
 
 ## 🧪 TESTING Y VALIDACIÓN
 - Pruebas ejecutadas: `npm run typecheck` → sin errores; `npm run test:focused` → 131/131 pass. Reproducción del diagnóstico: `claude --settings <worker settings> --permission-mode bypassPermissions -p "ok"` funciona en shell (descarta settings/bypass como causa); cronología de muertes en hive/log.jsonl correlaciona 100% con "flags embebidos en command".
-- Resultados obtenidos: EXITOSO (estático). La instancia dev corriendo NO tiene este código (electron-vite dev sin watch de main); validación runtime requiere reiniciar la app — se hará cuando Ryan termine su tarea en curso (decisión del humano), re-lanzando un smoke request CON flags que ahora debe vivir.
+- Resultados obtenidos: EXITOSO (estático + runtime). Validación runtime completada tras cierre de app por el humano (~21:10 UTC):
+  1. Roster de Ryan corregido con app cerrada (`command: claude --model claude-sonnet-5 --permission-mode bypassPermissions`, `model: claude-sonnet-5`).
+  2. Relanzada `npm run dev` con el código nuevo → Ryan auto-restaurado; su proceso vivo verificado con `ps`: lleva `--model claude-sonnet-5` y `--permission-mode bypassPermissions` (ya no pide permisos).
+  3. Smoke request `smoke2` CON flags en `command` → el worker VIVIÓ: evento `session` 1s tras el spawn (ts 1786915058282) y mensaje `act:"done"` a los 22s (ts 1786915079678). Antes un request idéntico moría en <1s sin sesión. Fix confirmado con spawn real.
 - Problemas encontrados: ninguno nuevo.
 - Reparaciones realizadas: n/a.
-- Estado final: TESTS PASANDO — validación runtime pendiente del próximo reinicio de app (ver TESTEAR INMEDIATAMENTE)
+- Estado final: FUNCIONANDO CORRECTAMENTE
 
 ## ⚠️ PARA PRÓXIMO AGENTE
-- NO TOCAR: `roster-backups/`; la instancia dev vieja corre código anterior — reiniciar antes de probar spawns.
-- COMPLETAR al reiniciar la app (con la app CERRADA):
-  1. Editar en `<harnessHome>/roster.json` la entrada de Ryan (`agents[]`, id `worker-marketing`): `command` → `claude --model claude-sonnet-5 --permission-mode bypassPermissions` (lo que god pidió en `.done/marketing-ryan-v3.json`); opcional `model: claude-sonnet-5`.
-  2. Relanzar `npm run dev`; Ryan se auto-restaura con resume de su sesión de hoy (transcript ya existe) y sin pedir permisos.
-  3. Smoke: drop en `hive/spawn-requests/` de un request con `command` con flags → el worker debe VIVIR, con tarjeta, y auto-archivarse al done.
-- CUIDADO CON: no matar la app mientras Ryan esté a mitad de tarea (pierde el turno en curso; el resume recupera contexto pero no el trabajo no guardado).
-- TESTEAR INMEDIATAMENTE: los 3 pasos de COMPLETAR.
+- NO TOCAR: `roster-backups/`.
+- COMPLETAR: pendientes heredados del handoff 003 (muerte del miner mempalace por NaN embeddings; borrar cards/residuos `worker-smoke`/`worker-smoke2` desde la UI si molestan; merge de branches; npm audit).
+- CUIDADO CON: no matar la app mientras un agente esté a mitad de tarea (pierde el turno en curso; el resume recupera contexto pero no el trabajo no guardado); editar `roster.json` SOLO con la app cerrada.
+- TESTEAR INMEDIATAMENTE: nada crítico — flujo god→worker validado end-to-end con spawn real.
 
 ## 📦 COMMIT REALIZADO
 ```
