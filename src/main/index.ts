@@ -4111,8 +4111,29 @@ async function processSpawnRequest(filePath: string): Promise<void> {
   const cwd = typeof raw.cwd === 'string' && raw.cwd.trim() ? expandTilde(raw.cwd) : '';
   if (!cwd || !existsSync(cwd)) { fail(`"cwd" missing or not found (${cwd || 'unset'})`); return; }
 
-  const command = typeof raw.command === 'string' && raw.command.trim() ? raw.command.trim() : (readConfig().defaultCommand ?? 'claude');
-  const bin = command.split(/\s+/)[0] || command;
+  const cfgSpawn = readConfig();
+  let command = typeof raw.command === 'string' && raw.command.trim() ? raw.command.trim() : (cfgSpawn.defaultCommand ?? 'claude');
+  // Inherit the app's auto (skip-permissions) mode when the request takes no
+  // stance of its own: a headless worker has no human to click through tool
+  // prompts, so without the flag it stalls at the first ask until the idle
+  // reaper kills it. An explicit --permission-mode in the request always wins,
+  // and non-claude commands are left untouched.
+  if (cfgSpawn.autoMode && inferAgentProvider(command, raw.provider) === 'claude' && !command.includes('--permission-mode')) {
+    command += ' --permission-mode bypassPermissions';
+  }
+  // god authors `command` as a full command LINE ("claude --model … --permission-mode …"),
+  // but the PTY layer takes ONE executable name (resolveCommand) plus argv — the
+  // unsplit line made node-pty exec a binary literally named like the whole
+  // string → ENOENT → the worker died within ~1s of spawning while its request
+  // archived as .done (this killed both flag-carrying Ryan spawns on 2026-08-16;
+  // only the bare-`claude` one lived). Split it here — same quoting rules as the
+  // renderer's tokenizeCommand — and hand the flags over as argv.
+  const tokens: string[] = [];
+  const tokenRe = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let tok: RegExpExecArray | null;
+  while ((tok = tokenRe.exec(command)) !== null) tokens.push(tok[1] ?? tok[2] ?? tok[3]);
+  const bin = tokens[0] || command;
+  const cmdFlags = tokens.slice(1);
   // Missing-CLI → FAIL FAST. A headless worker has no human to watch an installer,
   // so we never run the cc49e1e install banner here — we reject and tell god.
   if (!ptyManager.isCommandAvailable(bin)) { fail(`engine CLI "${bin}" is not installed`); return; }
@@ -4141,8 +4162,11 @@ async function processSpawnRequest(filePath: string): Promise<void> {
     brokerEnv.MD_BROKER_TOKEN = token;
   }
   const spawnOpts: AgentSpawnOptions = {
-    id: workerId, cwd, command, cols: 120, rows: 32,
-    args: raw.model ? ['--model', raw.model] : [],
+    id: workerId, cwd, command: bin, cols: 120, rows: 32,
+    // A separate `model` field only applies when the command line didn't pick a
+    // model itself (spawnAgentCore likewise skips its default-model injection
+    // when argv already carries --model).
+    args: [...cmdFlags, ...(raw.model && !cmdFlags.includes('--model') ? ['--model', raw.model] : [])],
     hive: meta, isolate, provider: raw.provider, env: brokerEnv
   };
 
