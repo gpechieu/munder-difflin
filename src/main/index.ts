@@ -387,6 +387,12 @@ const preservedWorktrees = new Map<string, PreservedWorktree>();
  * error can never crash the caller (an IPC handler or node-pty's onExit).
  */
 function teardownPty(id: string): void {
+  // Ephemeral-worker flag, read BEFORE the cleanup below deletes the entry. All
+  // worker deaths (done-release, idle/token reap, crash) funnel through here,
+  // so this is the one place their floor card gets archived (workers now card
+  // via the hive:agentSpawned broadcast in processSpawnRequest). pty id ==
+  // worker id == agent id for workers.
+  const wasWorker = liveWorkers.has(id);
   // 0) Revoke this id's broker capability (if any). Idempotent + harmless for a
   //    non-worker PTY; ensures a dead worker's token can never reach an integration.
   try { integrationBroker.revoke(id); } catch { /* best-effort */ }
@@ -426,6 +432,12 @@ function teardownPty(id: string): void {
   // A worker whose isolation failed (non-repo cwd) has no worktree to gate above —
   // still clear its tracking entry so the controller stops watching a dead PTY.
   if (liveWorkers.has(id)) liveWorkers.delete(id);
+  // Archive the dead worker's floor card (mirrors killAgent's voice-kill path;
+  // the renderer's archiveAgent is a no-op if the card is already gone). NOT
+  // done for regular agents: their kill flows already manage their own card.
+  if (wasWorker) {
+    try { liveWebContents()?.send('hive:agentArchived', { id }); } catch { /* window torn down */ }
+  }
   syncKeepAwake();
 }
 
@@ -4134,15 +4146,30 @@ async function processSpawnRequest(filePath: string): Promise<void> {
     hive: meta, isolate, provider: raw.provider, env: brokerEnv
   };
 
-  let res: { ok: boolean; error?: string };
+  let res: { ok: boolean; error?: string; worktreePath?: string };
   try {
-    // Output routes to the primary window (no renderer evt here). Workers are
-    // headless-by-design — they reply to Slack + report to god, not a watching human.
     res = await spawnAgentCore(spawnOpts, liveWebContents());
   } catch (e) {
     res = { ok: false, error: String(e) };
   }
   if (!res.ok) { integrationBroker.revoke(workerId); fail(`spawn failed — ${res.error ?? 'unknown error'}`); return; }
+
+  // A god-hired worker is a MAIN-initiated spawn, so the renderer would never
+  // card it on its own (same reason as the voice-spawn broadcast): without this
+  // the worker is invisible on the floor, never enters the roster, and after a
+  // restart nothing offers to restore it. The card rides the normal agent
+  // lifecycle from here — teardownPty broadcasts the matching archive.
+  try {
+    liveWebContents()?.send('hive:agentSpawned', {
+      id: workerId,
+      name: meta.name,
+      provider: raw.provider ?? 'claude',
+      cwd: res.worktreePath ?? cwd,
+      command,
+      role: meta.role,
+      worktreePath: res.worktreePath
+    });
+  } catch { /* window torn down */ }
 
   // Register for done-scan / idle-reap / token-cap / safe teardown (pty id == workerId).
   // tokenCap is optional plumbing (default unlimited) — only a positive finite cap is kept.
