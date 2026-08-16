@@ -382,9 +382,13 @@ const preservedWorktrees = new Map<string, PreservedWorktree>();
  * per dead PTY.
  *
  * Idempotent: guarded on map presence and the already-idempotent
- * `hive.setArchived`, so the second call (kill() also makes node-pty fire
- * onExit) is a harmless no-op. Best-effort — every step is wrapped so a teardown
- * error can never crash the caller (an IPC handler or node-pty's onExit).
+ * `hive.setArchived`, so a double call is a harmless no-op. NOTE: an explicit
+ * `ptyManager.kill()` does NOT reach here via onExit — kill() deletes the
+ * session synchronously, so node-pty's later async exit callback fails the
+ * session-identity guard and is swallowed. Every kill site must therefore call
+ * teardownPty itself right after the kill (all of them do). Best-effort — every
+ * step is wrapped so a teardown error can never crash the caller (an IPC
+ * handler or node-pty's onExit).
  */
 function teardownPty(id: string): void {
   // Ephemeral-worker flag, read BEFORE the cleanup below deletes the entry. All
@@ -4290,8 +4294,14 @@ async function ephemeralWorkerTick(): Promise<void> {
     const defaultTokenCap = typeof cfg.defaultWorkerTokenCap === 'number' && cfg.defaultWorkerTokenCap > 0
       ? cfg.defaultWorkerTokenCap : 0;
 
-    // (1) Finish or reap. ptyManager.kill → teardownPty → gated worktree + archive
-    //     + liveWorkers.delete. `releasing` guards the gap before onExit fires.
+    // (1) Finish or reap. Each release calls teardownPty EXPLICITLY after the
+    //     kill, like every other kill site: ptyManager.kill() deletes the session
+    //     synchronously, so when node-pty's async onExit later fires it fails the
+    //     session-identity guard and the global exit handler (→ teardownPty)
+    //     never runs. Relying on onExit here left released workers un-torn-down:
+    //     no hive archive, no hive:agentArchived, frozen floor cards, and god
+    //     kept mailing dead agents (seen live 2026-08-16 with worker-business/
+    //     worker-qa/worker-bizreview). A double teardown is a harmless no-op.
     for (const [workerId, rec] of [...liveWorkers]) {
       if (rec.releasing) continue;
       if (workerSignaledDone(workerId, rec.spawnedAt)) {
@@ -4299,6 +4309,7 @@ async function ephemeralWorkerTick(): Promise<void> {
         rec.releasing = true;
         console.log(`[worker] ${workerId} signaled done — releasing`);
         ptyManager.kill(workerId);
+        teardownPty(workerId);
         continue;
       }
       // Token-cap reap (default-off plumbing). An effective cap > 0 → reap when the
@@ -4315,6 +4326,7 @@ async function ephemeralWorkerTick(): Promise<void> {
             rec.slack
           );
           ptyManager.kill(workerId);
+          teardownPty(workerId);
           continue;
         }
       }
@@ -4329,6 +4341,7 @@ async function ephemeralWorkerTick(): Promise<void> {
           rec.slack
         );
         ptyManager.kill(workerId);
+        teardownPty(workerId);
       }
     }
 
