@@ -36,4 +36,4 @@
 ```
 git commit -m "docs: handoff 002 - fix binario Electron no descargado (npm run dev) - Agente Claude-IMPLEMENTADOR - TESTED"
 ```
-Hash: 2fb024b
+Hash: 68cc621
