@@ -32,8 +32,10 @@
 - CUIDADO CON: la app quedó CERRADA (el usuario la relanza normal; auto-restore revive a god/Ryan/David/Angela/Oscar); roster.json editado a mano CON LA APP CERRADA (procedimiento documentado) solo para quitar la tarjeta de test.
 - TESTEAR INMEDIATAMENTE: nada crítico — en el próximo uso normal, ver en el dev log algún `[inbox-wake]` solo cuando un agente idle tenga mail sin drenar.
 
-## 📦 COMMIT REALIZADO
+## 📦 COMMITS REALIZADOS
 ```
 git commit -m "fix: issues upstream #140 (tilde en harness home), #141 (ANSI en thought bubbles), #151 (watchdog inbox-wake de workers en main, idle por hooks) - Agente Claude-IMPLEMENTADOR - TESTED"
+git commit -m "docs: handoff 009 - issues upstream #140/#141/#151 arreglados, validados en runtime y propuestos (PRs #160-#162) - Agente Claude-DOCUMENTADOR"
 ```
-Hash: 030dfaa
+Hash fix: 030dfaa · Hash handoff: 8fd2f53
+Branches PR (fork gpechieu): fix/harness-home-tilde 0ca0e8d (PR #160) · fix/bubble-ansi-garble a3b75f6 (PR #161) · fix/worker-inbox-wake-watchdog 8c04534 (PR #162)
