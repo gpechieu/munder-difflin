@@ -34,5 +34,5 @@
 ```
 git commit -m "docs: handoff 011 - review #178 atendida: auto-mode provider-aware en #159 (5d38c86), #178 rebasado (ebdf65a), 3 preguntas respondidas - Agente Claude-REVIEWER"
 ```
-Hash: [pendiente - se registra en commit posterior, patrón handoffs 008-010]
+Hash: 4d9f424
 Branches fork: #159 `5d38c86` (fast-forward desde 51332ab) · #178 `ebdf65a` · resto sin cambios (ed8bc84/eca75c4/70092b6/3a879c5/0a4c4b0/8fc3d25)
