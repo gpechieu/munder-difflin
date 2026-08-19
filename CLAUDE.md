@@ -25,4 +25,8 @@ App Electron (electron-vite + React + better-sqlite3 + node-pty) que orquesta ag
 - Si `npm run dev` da `Error: Electron uninstall`: `node node_modules/electron/install.js` (handoff 002).
 - NO subir vite mientras electron-vite sea 5.x (peer `^5||^6||^7`); better-sqlite3 ≥13 para Electron 43 (handoff 001).
 
+## Upstream (fork gpechieu → chaitanyagiri/munder-difflin)
+- 8 PRs abiertos: #156-#162 + #178 (floor cards, APILADO sobre #159). Review del maintainer atendida 2026-08-19 (handoff 010): branches `fix/*` locales = estado exacto de los PRs, rebasados sobre su main (258 tests) — NO tocarlos sin rebasar #178 si #159 cambia.
+- OJO divergencia: el feature branch local aún lleva las versiones PRE-review de esos fixes (pin mempalace incondicional, lista de 5 markers en pty.ts, tokenizer duplicado, sin hung-turn override en inboxWake, ansiText en components/). Al mergear upstream, adoptar las formas revisadas localmente.
+
 Handoffs cronológicos en `handoffs/`.
