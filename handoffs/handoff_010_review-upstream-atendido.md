@@ -37,5 +37,5 @@ Pasada completa en worktree aislado (`git worktree` sobre origin/main 92461ab + 
 ```
 git commit -m "docs: handoff 010 - review upstream atendido: 7 PRs rebasados+corregidos, PR #178 nuevo, respuestas publicadas - Agente Claude-REVIEWER"
 ```
-Hash: a48e728
+Hash: 665c2da (definitivo registrado en commit posterior, patrón handoffs 008/009)
 Branches fork: #156 ed8bc84 · #157 eca75c4 · #158 70092b6 · #159 51332ab · #160 3a879c5 · #161 0a4c4b0 · #162 8fc3d25 · #178 aa50aa7
