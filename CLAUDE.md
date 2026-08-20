@@ -3,7 +3,7 @@
 App Electron (electron-vite + React + better-sqlite3 + node-pty) que orquesta agentes Claude Code como "empleados" en una oficina virtual. God = Michael (proxy del humano); workers = empleados contratados.
 
 ## Datos operativos clave
-- **harnessHome** (datos de usuario, NO en este repo): `/Users/gastonpechieu/Develop/Oficina_Neus` — leído de `~/Library/Application Support/munder-difflin/config.json`.
+- **harnessHome** (datos de usuario, NO en este repo): `/Users/gastonpechieu/Develop/NEUS_Headquarters` desde 2026-08-20 (antes `Oficina_Neus`; hives recientes también: `QA_Difflin_A`) — leído de `~/Library/Application Support/munder-difflin/config.json`. OJO: esa config tiene `defaultWorkerTokenCap: 150000`, que aplica a TODA contratación de god sin cap propio (ver buglog `worker-token-cap-cwd-contamination`).
 - **Roster** (tarjetas del piso): `<harnessHome>/roster.json`, backups append-only en `roster-backups/` (nunca se pierde nada; ver `src/main/roster.ts`). El renderer es el dueño: mientras la app corre, cualquier edición externa del archivo será pisada por el próximo flush (500ms debounce + beforeunload). Para editarlo a mano: cerrar la app primero.
 - **Hive** (workspaces de agentes): `<harnessHome>/hive/` — `registry.json`, `log.jsonl` (activity), `agents/<id>/` (identity.md, memory.md, inbox/, outbox/), `spawn-requests/` (cola de contrataciones de god; `.done`/`.failed`).
 - Transcripts de sesiones de agentes: `~/.claude/projects/<cwd-slug>/<sessionId>.jsonl` (config global, no per-agent).
