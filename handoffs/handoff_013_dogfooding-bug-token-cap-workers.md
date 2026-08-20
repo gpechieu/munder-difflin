@@ -31,4 +31,4 @@
 ```
 git commit -m "docs: handoff 013 - dogfooding 3h: harness estable, bug upstream token-cap workers diagnosticado (muerte en 1,5s por transcriptFallback por cwd) - Agente Claude-TESTER"
 ```
-Hash: [PENDIENTE] (+ cfbce5b docs CLAUDE.md previo)
+Hash: 56dd781 (+ cfbce5b docs CLAUDE.md previo)
