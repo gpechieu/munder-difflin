@@ -21,13 +21,13 @@ App Electron (electron-vite + React + better-sqlite3 + node-pty) que orquesta ag
 - Los mensajes user↔agente van por `inbox/`/`outbox/` del agent dir con env `AGENT_ID`/`AGENT_DIR`/`HIVE_*` inyectado al PTY.
 
 ## Validación (proyecto = app de escritorio)
-- `npm run typecheck` + `npm run test:focused` (131 tests) + arranque real `npm run dev` (ver que Electron viva y el log sin errores nuevos).
+- `npm run typecheck` + `npm run test:focused` (288 tests; suite completa `node --test test/*.test.cjs` = 307) + arranque real `npm run dev` (ver que Electron viva y el log sin errores nuevos).
 - Si `npm run dev` da `Error: Electron uninstall`: `node node_modules/electron/install.js` (handoff 002).
 - NO subir vite mientras electron-vite sea 5.x (peer `^5||^6||^7`); better-sqlite3 ≥13 para Electron 43 (handoff 001).
 
 ## Upstream (fork gpechieu → chaitanyagiri/munder-difflin)
 - 8 PRs abiertos: #156-#162 + #178 (floor cards, APILADO sobre #159: los 2 primeros commits de #178 SON #159). Reviews del maintainer atendidas 2026-08-19 (handoffs 010-011): branches `fix/*` locales = estado exacto de los PRs — NO tocarlos sin rebasar #178 si #159 cambia (patrón `git rebase --onto`). #159 = `5d38c86` (auto-mode provider-aware vía `autoModeFlagForProvider` + stance-check por token + `commandForAutoMode` borrada), #178 = `ebdf65a`. 272/272 tests en ese stack (main upstream solo = 258).
 - Decisiones pendientes DEL MAINTAINER: product call visibilidad workers (#178), sign-off autoMode/Slack, bounded-retry (#162). Ofrecido en #178: excluir tarjetas de god-workers del AUTO-restore (manual restore sigue = adopción como agente normal); implementar solo si lo pide.
-- OJO divergencia: el feature branch local aún lleva las versiones PRE-review de esos fixes (pin mempalace incondicional, lista de 5 markers en pty.ts, tokenizer duplicado, sin hung-turn override en inboxWake, ansiText en components/, auto-mode claude-only en workerLaunch). Al mergear upstream, adoptar las formas revisadas localmente.
+- **Divergencia RESUELTA 2026-08-20 (merge e64c543, handoff 012)**: el feature branch local ya contiene upstream main v0.4.4 (1a805ea) + los 8 PRs en forma POST-review (`src/`+`test/` = idénticos al branch `integration/upstream-8-fixes`, conservado como referencia). Único delta local intencional: bloque de deps en package.json (Electron ^43, better-sqlite3 ^13, electron-vite ^5, vite ^7, @electron/rebuild ^4, localtunnel ^1.8.3) + package-lock — upstream sigue en Electron 32: en futuros merges PRESERVAR el stack local de deps.
 
 Handoffs cronológicos en `handoffs/`.
