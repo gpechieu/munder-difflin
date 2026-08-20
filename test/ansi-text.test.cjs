@@ -11,7 +11,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const loadTs = require('./load-ts.cjs');
 
-const { stripAnsi } = loadTs('src/renderer/src/components/ansiText.ts');
+const { stripAnsi, splitTrailingPartialEscape, MAX_ESC_CARRY } = loadTs('src/shared/ansiText.ts');
 
 test('translates cursor-forward into spaces (the issue #141 capture)', () => {
   // Reconstructed from the screenshot attached to the issue: the CLI repaints
@@ -54,4 +54,42 @@ test('stray two-byte escapes and charset selects go too', () => {
 test('plain text — unicode included — passes through untouched', () => {
   const s = '● Bash npm test — 131/131 ✔ (déjà vu)';
   assert.equal(stripAnsi(s), s);
+});
+
+// — split-across-chunks (PTY reads land on arbitrary byte boundaries) —
+
+/** Feed chunks the way usePtyParser does: hold the carry, prepend to the next. */
+function scrapeChunks(chunks) {
+  let carry = '';
+  let out = '';
+  for (const c of chunks) {
+    const r = splitTrailingPartialEscape(carry + c);
+    carry = r.carry;
+    out += stripAnsi(r.text);
+  }
+  return out;
+}
+
+test('an escape split across two chunks reassembles instead of leaking as text', () => {
+  assert.equal(scrapeChunks(['all\x1b[1', 'Cthree']), 'all three', 'CSI split mid-parameters');
+  assert.equal(scrapeChunks(['hi\x1b', '[2Jthere']), 'hithere', 'split right after ESC');
+  assert.equal(scrapeChunks(['x\x1b]0;tit', 'le\x07y']), 'xy', 'OSC split mid-title');
+  assert.equal(scrapeChunks(['a\x1b(', 'Bb']), 'ab', 'charset select split');
+});
+
+test('a completed sequence at end-of-chunk is NOT held back', () => {
+  const r = splitTrailingPartialEscape('done\x1b[2m');
+  assert.equal(r.text, 'done\x1b[2m');
+  assert.equal(r.carry, '');
+});
+
+test('text with no escapes carries nothing', () => {
+  assert.deepEqual(splitTrailingPartialEscape('plain'), { text: 'plain', carry: '' });
+});
+
+test('a pathological partial past the bound is let through, not held forever', () => {
+  const runaway = 'x\x1b]0;' + 't'.repeat(MAX_ESC_CARRY + 10);
+  const r = splitTrailingPartialEscape(runaway);
+  assert.equal(r.carry, '', 'gives up rather than stall the bubble');
+  assert.equal(r.text, runaway);
 });

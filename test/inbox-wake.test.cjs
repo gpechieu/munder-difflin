@@ -11,7 +11,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const loadTs = require('./load-ts.cjs');
 
-const { inboxWakeTick, WAKE_QUIET_MS, WAKE_RETRY_MS } = loadTs('src/main/inboxWake.ts');
+const { inboxWakeTick, WAKE_QUIET_MS, WAKE_RETRY_MS, HOOK_STALE_MS } = loadTs('src/main/inboxWake.ts');
 
 const QUIET = WAKE_QUIET_MS + 1;
 
@@ -32,6 +32,8 @@ test('fires for a quiet worker holding undrained mail', () => {
   assert.equal(fires.length, 1);
   assert.equal(fires[0].agentId, 'w1');
   assert.equal(fires[0].newestId, '2026-01-01T00-00-aaa');
+  assert.deepEqual(fires[0].inboxIds, ['2026-01-01T00-00-aaa'], 'renderer syncs its per-id dedup from these');
+  assert.equal(fires[0].idleSource, 'pty', 'hookless — pty recency decided');
   assert.equal(fires[0].count, 1);
 });
 
@@ -56,9 +58,23 @@ test('hook-idle wins over a constantly-repainting TUI (the claude idle prompt)',
   assert.equal(inboxWakeTick(d, new Map(), 1_000_000).length, 1);
 });
 
-test('hook-busy (a turn in flight or a HITL prompt) never fires, even with a quiet pty', () => {
-  const d = deps({ hookIdleFor: () => 0, idleFor: () => QUIET * 100 });
+test('hook-busy (a turn in flight or a HITL prompt) never fires while the pty silence is plausible', () => {
+  // A legitimately long QUIET tool call (a slow build emitting nothing): the
+  // hook state says mid-turn and the silence is under HOOK_STALE_MS, so the
+  // watchdog stays out of the way.
+  const d = deps({ hookIdleFor: () => 0, idleFor: () => HOOK_STALE_MS - 1 });
   assert.equal(inboxWakeTick(d, new Map(), 1_000_000).length, 0);
+});
+
+test('a HUNG turn is not invisible: pty silence past HOOK_STALE_MS overrides a stuck busy hook', () => {
+  // The CLI hangs, crashes without a Stop, or its hook delivery fails: hookIdleFor
+  // returns 0 forever. A genuinely working turn keeps the pty emitting, so an
+  // hour of true silence is the tell — the watchdog must still fire.
+  const d = deps({ hookIdleFor: () => 0, idleFor: () => HOOK_STALE_MS + 1 });
+  const fires = inboxWakeTick(d, new Map(), 1_000_000);
+  assert.equal(fires.length, 1);
+  assert.equal(fires[0].idleSource, 'pty', 'labeled as the override, not as hook idleness');
+  assert.equal(fires[0].idleMs, HOOK_STALE_MS + 1);
 });
 
 test('the same undrained mail re-fires only after the retry window', () => {

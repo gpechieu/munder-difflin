@@ -10,7 +10,7 @@ import {
   type AgentProvider
 } from '../shared/agentProvider';
 import { defaultMcpDefaults } from '../shared/mcpCatalog';
-import { expandTilde } from './fs';
+import { expandTilde, normalizeHiveHome } from './fs';
 import type { IntegrationRecord } from '../shared/integrations';
 import {
   DEFAULT_CONTEXT_TRIGGER,
@@ -574,10 +574,33 @@ export function readConfig(): HarnessConfig {
   try {
     const raw = readFileSync(p, 'utf8');
     const parsed = JSON.parse(raw);
-    return migrateTriggersV1(withTriggerDefaults({ ...DEFAULTS, ...parsed }));
+    return normalizeStoredHomes(migrateTriggersV1(withTriggerDefaults({ ...DEFAULTS, ...parsed })));
   } catch {
     return withTriggerDefaults({ ...DEFAULTS });
   }
+}
+
+/** (#140, the upgrade path) A config.json persisted BEFORE `writeConfig`
+ *  learned to expand `~` still holds literal `~/…` strings in `harnessHome` /
+ *  `recentHives`, and nothing rewrites the file until the next write — so the
+ *  hive picker renders the raw `~` string and feeds it straight back into
+ *  `config:changeHome`, which lands on `resolve()` → `<cwd>/~/…`, a real
+ *  directory named "~". `normalizeHiveHome` only cleans values on the way IN;
+ *  this cleans them on the way OUT, so no consumer can see a `~` path
+ *  regardless of the file's vintage. Expanded duplicates collapse (a stale
+ *  "~/X" next to its absolute twin becomes one entry). */
+function normalizeStoredHomes(cfg: HarnessConfig): HarnessConfig {
+  if (typeof cfg.harnessHome === 'string' && cfg.harnessHome.trim()) {
+    cfg.harnessHome = expandTilde(cfg.harnessHome);
+  }
+  if (Array.isArray(cfg.recentHives)) {
+    const seen = new Set<string>();
+    cfg.recentHives = cfg.recentHives
+      .filter((h): h is string => typeof h === 'string' && !!h.trim())
+      .map((h) => expandTilde(h))
+      .filter((h) => (seen.has(h) ? false : (seen.add(h), true)));
+  }
+  return cfg;
 }
 
 function persistConfig(next: HarnessConfig): HarnessConfig {
@@ -600,19 +623,20 @@ export function writeConfig(patch: Partial<HarnessConfig>): HarnessConfig {
       .map((r) => expandTilde(r))
       .filter((r) => r && !seen.has(r) && (seen.add(r), true));
   }
-  // Home INGESTION — same rule as registeredRepos above: onboarding lets the
-  // user TYPE this path ("~/HarnessAgents"), and every derived path (hive root,
-  // palace, roster) joins on the persisted value, so a literal `~` breaks them
-  // all (issue #140: onboarding finish died on `ENOENT: mkdir '~/HarnessAgents'`).
+  // The HIVE HOME needs the exact same treatment as registeredRepos above, and for
+  // years it did not get it (#140). Onboarding SUGGESTS `~/HarnessAgents` and the
+  // field is free text, so the common path — accept the default, press Finish —
+  // persisted a literal `~`. The first thing the finish step does is create the
+  // directory, and Node's mkdir has no idea what `~` means: it tried to make a
+  // folder actually named "~", which fails as
+  //   ENOENT: no such file or directory, mkdir '~/HarnessAgents'
+  // and left the wizard wedged on its last step with no way forward. Expand BEFORE
+  // the value is persisted or copied into recentHives, so every downstream reader
+  // (mkdir, the hive root, the launch picker) sees one absolute path.
   if (typeof patch.harnessHome === 'string' && patch.harnessHome) {
-    const home = expandTilde(patch.harnessHome);
+    const { home, recentHives } = normalizeHiveHome(patch.harnessHome, current.recentHives ?? []);
     next.harnessHome = home;
-    // Track recently-opened hive homes so the launch picker can list them. Any
-    // write that SETS harnessHome (onboarding finish, changeHome) promotes it to
-    // the front, deduped and capped. Skips empty/null so a clear doesn't pollute
-    // the list.
-    const prior = current.recentHives ?? [];
-    next.recentHives = [home, ...prior.filter((h) => h !== home)].slice(0, 8);
+    next.recentHives = recentHives;
   }
   return persistConfig(next);
 }
@@ -664,25 +688,17 @@ export function modelForRole(
   return MODEL_WORKER;
 }
 
-/** Auto-suggested command string given current autoMode preference. */
-export function commandForAutoMode(
-  config: HarnessConfig,
-  provider?: AgentProvider
-): string {
-  const p = provider ?? inferAgentProvider(config.defaultCommand);
-  const base = p === 'claude' || p === 'custom'
-    ? config.defaultCommand
-    : defaultCommandForProvider(p, config.defaultCommand);
-  if (!config.autoMode) return base;
-  const flag = autoModeFlagForProvider(p);
-  return flag ? `${base} ${flag}` : base;
-}
-
-/** Ensure harnessHome exists on disk. Expands `~` first — the onboarding wizard
- *  lets the user type the path, and mkdir treats a literal `~` as a plain
- *  directory name (issue #140's `ENOENT: mkdir '~/HarnessAgents'`). */
+/** Ensure harnessHome exists on disk. */
 export function ensureHarnessHome(path: string): { ok: boolean; error?: string } {
   try {
+    // Expand HERE too, not only at the config write (#140). This runs FIRST —
+    // onboarding calls it before updateConfig — so normalizing only at the write
+    // boundary left the actual mkdir still receiving a literal `~`. Depending on
+    // the process cwd that either fails outright or, worse, quietly succeeds by
+    // creating a directory genuinely named "~" somewhere nobody will look, and
+    // the hive then lives at a path the user cannot find. This is the
+    // "defense-in-depth at the consumers" the expandTilde doc calls for: the
+    // ingestion point normalizes, and the consumer refuses to trust that it did.
     mkdirSync(expandTilde(path), { recursive: true });
     return { ok: true };
   } catch (e) {

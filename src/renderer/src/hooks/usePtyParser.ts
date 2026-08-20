@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { useStore, type ToolKind, type StationKind } from '@/store/store';
-import { stripAnsi } from '@/components/ansiText';
+import { splitTrailingPartialEscape, stripAnsi } from '@shared/ansiText';
 
 // Tool call lines look like: `● Read SPEC.md`, `● Bash npm test`, `● Edit src/foo.ts`
 const TOOL_RE = /●\s+([A-Za-z][A-Za-z_]*)(?:\s+(.+))?/g;
@@ -51,6 +51,8 @@ export function usePtyParser(agentId: string) {
   const updateAgent = useStore(s => s.updateAgent);
   const pushFeed = useStore(s => s.pushFeed);
   const idleTimerRef = useRef<number | null>(null);
+  // Tail of an escape sequence split across PTY chunks (see the callback).
+  const escCarryRef = useRef('');
 
   const scheduleIdle = useCallback(() => {
     if (idleTimerRef.current !== null) {
@@ -84,7 +86,13 @@ export function usePtyParser(agentId: string) {
   }, []);
 
   return useCallback((chunk: string) => {
-    const text = stripAnsi(chunk);
+    // PTY chunk boundaries are arbitrary, so an escape can arrive split across
+    // two reads (`…ESC[1` then `C…`) — held here and reassembled, otherwise
+    // the halves would land in the bubble as literal text (#141's symptom
+    // through a different door). Bounded; see splitTrailingPartialEscape.
+    const { text: whole, carry } = splitTrailingPartialEscape(escCarryRef.current + chunk);
+    escCarryRef.current = carry;
+    const text = stripAnsi(whole);
     if (!text.trim()) return;
 
     // Passive context-limit sniffing from /context output (the gauge poll

@@ -126,6 +126,16 @@ export class HookServer {
     return a.idle ? Date.now() - a.since : 0;
   }
 
+  /** Drop a dead agent's per-agent hook state. Called from teardownPty so the
+   *  maps track the floor instead of growing per respawned id forever — and so
+   *  a REUSED id (model change kills + respawns under the same id) starts from
+   *  "no hook events yet" instead of inheriting the dead run's turn state. */
+  forget(agentId: string): void {
+    this.activity.delete(agentId);
+    this.contextById.delete(agentId);
+    this.transcriptPaths.delete(agentId);
+  }
+
   private handle(p: HookPayload): unknown {
     const agentId = p.agent_id ?? undefined;
     const event = p.hook_event_name ?? 'Unknown';

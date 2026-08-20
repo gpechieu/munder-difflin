@@ -223,7 +223,13 @@ export const QWEN_MODELS: ModelOption[] = [
  *  field stays editable; `opencode models` / models.dev is the source of truth).
  *  // TODO-verify exact live slugs (humanQA — they drift). */
 export const OPENCODE_MODELS: ModelOption[] = [
-  { id: undefined, label: 'default' },
+  // "CLI default", not "default" — the distinction ANTIGRAVITY_MODELS already
+  // draws: pass NO --model and run whatever OpenCode itself is configured and
+  // authenticated for. That is not the harness's own default model, and calling
+  // both "default" is what made the two impossible to tell apart. This is now the
+  // PRESELECTED entry for OpenCode, because a BYOK slug the user holds no key for
+  // fails silently — see the recommendedOrchestratorModel note in agentProvider.ts.
+  { id: undefined, label: 'CLI default' },
   { id: 'anthropic/claude-sonnet-4-5', label: 'Claude Sonnet 4.5 (Anthropic)' },
   { id: 'anthropic/claude-haiku-4-5', label: 'Claude Haiku 4.5 (Anthropic)' },
   { id: 'openai/gpt-5', label: 'GPT-5 (OpenAI)' },
@@ -282,6 +288,7 @@ export const GROK_MODELS: ModelOption[] = [
   // harness's `config.defaultModel`; the pickers mark that one separately, and
   // labelling both "default" is what made the two impossible to tell apart.
   { id: undefined, label: 'CLI default' },
+  { id: 'grok-4.6', label: 'Grok 4.6' },
   { id: 'grok-4.5', label: 'Grok 4.5' }
 ];
 
@@ -296,16 +303,11 @@ export const KIMI_MODELS: ModelOption[] = [
   { id: 'kimi-code/kimi-for-coding-highspeed', label: 'Kimi K2.7 · HighSpeed' }
 ];
 
-/** Split a command string into argv, respecting double/single quotes so a model
- *  value with spaces (agy's `--model "Gemini 3.1 Pro (High)"`) stays one token.
- *  Quotes are stripped from the result. */
-export function tokenizeCommand(command: string): string[] {
-  const out: string[] = [];
-  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(command)) !== null) out.push(m[1] ?? m[2] ?? m[3]);
-  return out;
-}
+// tokenizeCommand moved to src/shared/commandLine.ts so main's spawn-request
+// path splits command lines with the SAME rules as the renderer's spawn flows
+// (they used to carry byte-identical copies). Re-exported here so existing
+// importers keep their path.
+export { tokenizeCommand } from '@shared/commandLine';
 
 /** The model preset list for a given provider's picker. */
 export function modelsForProvider(provider: AgentProvider): ModelOption[] {
