@@ -33,4 +33,4 @@
 ```
 git commit -m "merge: upstream main v0.4.4 (1a805ea) + los 8 PRs en forma post-review (#156-#162, #178) - adopta workerLaunch provider-aware, ptyEnv, shared/ansiText, watchdog con hung-turn override; conserva stack local Electron 43 - Agente Claude-IMPLEMENTADOR"
 ```
-Hash: e64c543 (merge) + [PENDIENTE] (docs: este handoff + CLAUDE.md)
+Hash: e64c543 (merge) + 24b4b40 (docs: este handoff + CLAUDE.md)
