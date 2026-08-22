@@ -10,6 +10,7 @@ import {
   type AgentProvider
 } from '../shared/agentProvider';
 import { defaultMcpDefaults } from '../shared/mcpCatalog';
+import { MAX_AGENT_TOKEN_CAP } from '../shared/tokenCaps';
 import { expandTilde, normalizeHiveHome } from './fs';
 import type { IntegrationRecord } from '../shared/integrations';
 import {
@@ -27,6 +28,12 @@ export interface ScheduledMission {
   id: string;
   label: string;
   intervalMs: number;
+  /** Day-of-week + time-of-day schedule. When present and valid this REPLACES
+   *  `intervalMs` — an interval cannot say "weekday mornings", because it drifts
+   *  against the clock and a 24h one started at 15:00 fires at 15:00 forever.
+   *  `intervalMs` is deliberately left on the record so switching back restores
+   *  the cadence the user had. See shared/weeklySchedule.ts. */
+  weekly?: { days: number[]; minute: number };
   to: string;
   body: string;
   enabled: boolean;
@@ -183,6 +190,16 @@ export interface HarnessConfig {
   registeredRepos: string[];
   /** When true, new agents are spawned with --permission-mode bypassPermissions. */
   autoMode: boolean;
+  /** May the orchestrator ("Michael") spin up agents on its own?
+   *
+   *  Default FALSE. Spawning an agent is a SPEND decision, so it should not
+   *  happen unprompted. The ability itself shipped in v0.4.4 with no gate at all,
+   *  so this closes an existing default-on behaviour rather than gating a new
+   *  feature: an operator who wants it must now say so.
+   *
+   *  Off does not FAIL a queued spawn request, it declines to consume one. The
+   *  request sits in HIVE_ROOT/spawn-requests until the toggle is turned on. */
+  orchestratorMaySpawn: boolean;
   /** The command we run when spawning a new agent. */
   defaultCommand: string;
   /** Default model for newly spawned agents (e.g. 'claude-sonnet-4-6[1m]'); unset = CLI default. */
@@ -406,6 +423,7 @@ const DEFAULTS: HarnessConfig = {
   recentHives: [],
   registeredRepos: [],
   autoMode: true,
+  orchestratorMaySpawn: false,
   defaultCommand: 'claude',
   godProvider: 'claude',
   godModel: 'claude-opus-4-8',
@@ -641,6 +659,37 @@ export function writeConfig(patch: Partial<HarnessConfig>): HarnessConfig {
   return persistConfig(next);
 }
 
+/** Set or clear one agent's token ceiling against the latest config on disk.
+ *
+ * Renderer config objects are snapshots. Replacing `agentTokenCaps` from one of
+ * those snapshots loses caps written since the snapshot was read (most visibly
+ * while reviewing a batch of imported hires). Keep the read-modify-write in the
+ * synchronous main process so each call merges with the result of the previous
+ * one before returning the updated config to the renderer. */
+export function setAgentTokenCap(agentId: unknown, tokenCap: unknown): HarnessConfig {
+  if (typeof agentId !== 'string' || agentId.trim().length === 0) {
+    throw new Error('invalid agent token cap');
+  }
+  if (
+    tokenCap !== undefined
+    && (
+      typeof tokenCap !== 'number'
+      || !Number.isInteger(tokenCap)
+      || tokenCap <= 0
+      || tokenCap > MAX_AGENT_TOKEN_CAP
+    )
+  ) throw new Error('invalid agent token cap');
+
+  const current = readConfig();
+  const agentTokenCaps = { ...(current.agentTokenCaps ?? {}) };
+  if (tokenCap === undefined) delete agentTokenCaps[agentId];
+  else agentTokenCaps[agentId] = tokenCap;
+  return persistConfig({
+    ...current,
+    agentTokenCaps
+  });
+}
+
 /** Wipe the persisted config back to first-run defaults so the app boots into
  *  onboarding again. Used by the "reset & start over" flow. */
 export function resetConfig(): HarnessConfig {
@@ -688,7 +737,9 @@ export function modelForRole(
   return MODEL_WORKER;
 }
 
-/** Ensure harnessHome exists on disk. */
+/** Ensure harnessHome exists on disk. Expands `~` first — the onboarding wizard
+ *  lets the user type the path, and mkdir treats a literal `~` as a plain
+ *  directory name (issue #140's `ENOENT: mkdir '~/HarnessAgents'`). */
 export function ensureHarnessHome(path: string): { ok: boolean; error?: string } {
   try {
     // Expand HERE too, not only at the config write (#140). This runs FIRST —

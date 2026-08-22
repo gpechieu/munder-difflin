@@ -58,8 +58,6 @@ export class HookServer {
    *  get_agent_detail / list_agents) can report "how full is each agent's context"
    *  without depending on a renderer round-trip. */
   private contextById = new Map<string, { tokens: number; limit: number; ts: number }>();
-  /** #151: per-agent turn state derived from real hook boundaries (see hookIdleFor). */
-  private activity = new Map<string, { idle: boolean; since: number }>();
 
   constructor(
     private hive: HiveManager,
@@ -69,7 +67,14 @@ export class HookServer {
     private control?: ControlRegistry,
     /** Circuit breaker (Lane A #6.6b) — fed the hook-derived signals (session id,
      *  repeated identical tool calls). Optional so the server still runs without it. */
-    private breaker?: CircuitBreaker
+    private breaker?: CircuitBreaker,
+    /** Standing goal text for an agent (from the durable roster). Optional so
+     *  tests can omit it; when set, injected on SessionStart / UserPromptSubmit. */
+    private getStandingGoal?: (agentId: string) => string | null,
+    /** Optional observer of every hook boundary (agentId, event, message). The
+     *  worker inbox-wake watchdog (workerWake.ts) feeds on this to learn when an
+     *  agent is parked on a permission/HITL prompt so it never types into it. */
+    private onEvent?: (agentId: string | undefined, event: string, message: string | undefined) => void
   ) {}
 
   start(): void {
@@ -114,31 +119,10 @@ export class HookServer {
     return this.contextById.get(agentId);
   }
 
-  /** ms the agent has been hook-idle — 0 while a turn is in flight (or a
-   *  notification/HITL prompt is pending) — or null when this agent has emitted
-   *  no hook events at all (hookless provider, or not yet booted). The
-   *  inbox-wake watchdog (#151) prefers this over raw pty quiet: claude's TUI
-   *  repaints its idle prompt constantly, so pty output recency cannot tell
-   *  "mid-turn" from "sitting at the prompt". */
-  hookIdleFor(agentId: string): number | null {
-    const a = this.activity.get(agentId);
-    if (!a) return null;
-    return a.idle ? Date.now() - a.since : 0;
-  }
-
-  /** Drop a dead agent's per-agent hook state. Called from teardownPty so the
-   *  maps track the floor instead of growing per respawned id forever — and so
-   *  a REUSED id (model change kills + respawns under the same id) starts from
-   *  "no hook events yet" instead of inheriting the dead run's turn state. */
-  forget(agentId: string): void {
-    this.activity.delete(agentId);
-    this.contextById.delete(agentId);
-    this.transcriptPaths.delete(agentId);
-  }
-
   private handle(p: HookPayload): unknown {
     const agentId = p.agent_id ?? undefined;
     const event = p.hook_event_name ?? 'Unknown';
+    this.onEvent?.(agentId, event, p.message);
     if (agentId && typeof p.transcript_path === 'string' && p.transcript_path) {
       this.transcriptPaths.set(agentId, p.transcript_path);
     }
@@ -171,20 +155,6 @@ export class HookServer {
         });
       }
       return {};
-    }
-
-    // #151: authoritative idle signal for the inbox-wake watchdog. Stop = a
-    // turn just ended; SessionStart = the CLI is sitting at its prompt (fresh
-    // spawn or --resume — without it a restarted agent that never ran a turn
-    // would read busy forever). Any other real boundary (tool use, prompt
-    // submit, a notification/HITL prompt, compaction, a subagent stopping
-    // while its parent runs) = busy. Status ticks returned above never reach
-    // here, so pure telemetry can't fake activity.
-    if (agentId) {
-      this.activity.set(agentId, {
-        idle: event === 'Stop' || event === 'SessionStart',
-        since: Date.now()
-      });
     }
 
     // 7C.3 — a graceful operator HALT overrides everything (incl. the inbox
@@ -294,14 +264,29 @@ export class HookServer {
     // God-only and one line — every other agent is unaffected.
     const wantsRoster = (event === 'SessionStart' || event === 'UserPromptSubmit')
       && !!agentId && this.hive.isGod(agentId);
-    const roster = wantsRoster ? this.hive.rosterContext() : null;
+    // Hand the roster the LIVE context-window occupancy (contextById) so each
+    // agent line can carry a `ctx NN%` — god then sees whose context is nearly
+    // full when it routes work, instead of guessing from cumulative token spend.
+    const roster = wantsRoster
+      ? this.hive.rosterContext((id) => this.contextFor(id))
+      : null;
 
-    if (steer || roster) {
+    // Standing goal (hire Briefing) — durable roster field, re-read every cycle so
+    // an Edit Agent save is picked up on the next SessionStart / UserPromptSubmit
+    // without restarting the worker. Kept out of --append-system-prompt (volatile-
+    // free cache invariant); lives on the live hook channel instead.
+    const wantsGoal = (event === 'SessionStart' || event === 'UserPromptSubmit') && !!agentId;
+    const goalRaw = wantsGoal ? (this.getStandingGoal?.(agentId) ?? null) : null;
+    const goal = goalRaw
+      ? `<goal>\n${goalRaw}\n</goal>`
+      : null;
+
+    if (steer || roster || goal) {
       this.emit(agentId, event, p);
       return {
         hookSpecificOutput: {
           hookEventName: event,
-          additionalContext: [roster, steer].filter(Boolean).join('\n\n')
+          additionalContext: [roster, goal, steer].filter(Boolean).join('\n\n')
         }
       };
     }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { useStore, type ToolKind, type StationKind } from '@/store/store';
-import { splitTrailingPartialEscape, stripAnsi } from '@shared/ansiText';
+import { createAnsiStripper } from '@/components/ansiText';
 
 // Tool call lines look like: `● Read SPEC.md`, `● Bash npm test`, `● Edit src/foo.ts`
 const TOOL_RE = /●\s+([A-Za-z][A-Za-z_]*)(?:\s+(.+))?/g;
@@ -51,8 +51,8 @@ export function usePtyParser(agentId: string) {
   const updateAgent = useStore(s => s.updateAgent);
   const pushFeed = useStore(s => s.pushFeed);
   const idleTimerRef = useRef<number | null>(null);
-  // Tail of an escape sequence split across PTY chunks (see the callback).
-  const escCarryRef = useRef('');
+  // One stripper per agent: it carries an escape split across pty chunks.
+  const stripRef = useRef(createAnsiStripper());
 
   const scheduleIdle = useCallback(() => {
     if (idleTimerRef.current !== null) {
@@ -63,7 +63,6 @@ export function usePtyParser(agentId: string) {
       updateAgent(agentId, {
         status: 'idle',
         action: 'awaiting',
-        description: 'on standby',
         carrying: undefined,
         currentStation: 'desk'
       });
@@ -86,13 +85,7 @@ export function usePtyParser(agentId: string) {
   }, []);
 
   return useCallback((chunk: string) => {
-    // PTY chunk boundaries are arbitrary, so an escape can arrive split across
-    // two reads (`…ESC[1` then `C…`) — held here and reassembled, otherwise
-    // the halves would land in the bubble as literal text (#141's symptom
-    // through a different door). Bounded; see splitTrailingPartialEscape.
-    const { text: whole, carry } = splitTrailingPartialEscape(escCarryRef.current + chunk);
-    escCarryRef.current = carry;
-    const text = stripAnsi(whole);
+    const text = stripRef.current(chunk);
     if (!text.trim()) return;
 
     // Passive context-limit sniffing from /context output (the gauge poll
@@ -124,7 +117,7 @@ export function usePtyParser(agentId: string) {
     if (lastTool) {
       const station = TOOL_TO_STATION[lastTool] ?? 'desk';
       const carrying = TOOLKIND_BY_NAME[lastTool] ?? undefined;
-      // Collapse space runs: translated cursor-forwards (see stripAnsi) can
+      // Collapse space runs: translated cursor-forwards (see ansiText) can
       // stand for several columns, and the bubble shouldn't show the gaps.
       const summary = (lastArg ? `${lastTool.toLowerCase()} ${lastArg}` : lastTool.toLowerCase())
         .replace(/\s+/g, ' ');
@@ -133,7 +126,6 @@ export function usePtyParser(agentId: string) {
       updateAgent(agentId, {
         status: 'working',
         action: summary,
-        description: summary,
         currentStation: station,
         carrying
       });
@@ -164,7 +156,6 @@ export function usePtyParser(agentId: string) {
         updateAgent(agentId, {
           status: 'blocked',
           action: 'waiting on you',
-          description: 'waiting on you',
           currentStation: 'mailbox',
           blockReason: {
             summary: 'Waiting for your reply',
@@ -179,7 +170,6 @@ export function usePtyParser(agentId: string) {
         updateAgent(agentId, {
           status: 'waiting',
           action: 'waiting on god',
-          description: 'waiting on god',
           currentStation: 'desk',
           blockReason: undefined
         });

@@ -3,7 +3,12 @@
  * restorable entries, and parked message queues, stored as one JSON file beside
  * the hive.
  *
- * WHY THIS EXISTS. All of that used to live only in the renderer's localStorage,
+ * WHY THIS EXISTS. This is the UI floor (cards, notes, queues, worktrees).
+ * Hive identity — id, role, cwd, session — lives in `<harnessHome>/hive/registry.json`
+ * and is what agents read. The two must not drift: `description` here is the
+ * same durable job string as registry `role`, never live status (pause/idle).
+ *
+ * All of that used to live only in the renderer's localStorage,
  * and localStorage is partitioned by ORIGIN. A dev run loads the renderer from
  * `http://localhost:5173` and a packaged build loads it from `file://`, so the
  * two never see each other's storage: switching between them showed an empty
@@ -70,10 +75,7 @@ function entryCount(s: RosterSnapshot): number {
  * A class rather than free functions because the empty-guard needs to know
  * whether THIS run has written yet, and a module-level flag would be invisible
  * shared state that no test could reset. One instance per process in `index.ts`;
- * tests make their own. The instance lives in MAIN, so a renderer reload reuses
- * it: the guard's state survives reloads (the 2026-08-16 incident was two
- * refusal-worthy writes in one run, minutes apart) and re-arms only on a fresh
- * app launch.
+ * tests make their own.
  */
 export class RosterStore {
   /** Set once this store has written successfully. The empty-guard applies only

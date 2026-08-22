@@ -11,20 +11,20 @@ import { homedir } from 'node:os';
 import { request as httpsRequest } from 'node:https';
 import { PtyManager, type SpawnOptions } from './pty';
 import { resolveCommand as resolveCliCommand } from './shellEnv';
-import { initAutoUpdater } from './updater';
+import { initAutoUpdater, abortPendingRestart } from './updater';
 import { RealtimeFloorWatcher } from './realtimeFloorWatcher';
 import {
-  readConfig, writeConfig, resetConfig, ensureHarnessHome, ensureClaudePermissionsAccepted,
+  readConfig, writeConfig, setAgentTokenCap, resetConfig, ensureHarnessHome, ensureClaudePermissionsAccepted,
   modelForRole, OPS_STANDUP_MISSION, HEARTBEAT_MISSION, COMPACT_MAINTENANCE_MISSION, type HarnessConfig, type ScheduledMission
 } from './config';
 import { listDir, readFileText, readFileBinary, writeFileText, statAbs, expandTilde } from './fs';
+import { normalizeWeekly, weeklyDelayMs } from '../shared/weeklySchedule';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo, getDiff, mainRepoRoot,
   addWorktree, removeWorktree, worktreeHasUnintegratedWork, worktreeIsGcSafe,
   getLogGraph, getCommitFiles, getFileAtRev, compareRefs, listWorktrees, checkoutRef
 } from './git';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
-import { inboxWakeTick, type InboxWakeState } from './inboxWake';
 import { HookServer } from './hooks';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
@@ -54,6 +54,7 @@ import { registerRealtimeActionIpc } from './realtimeActions';
 import { initCompletionWatcher } from './realtimeCompletionWatcher';
 import type { TaskCard, InboxMessage } from './realtimeCompletionWatcher';
 import { TelemetryCollector } from './telemetry';
+import { CostLedgerTotals } from './costLifetime';
 import { analytics } from './analytics';
 import { IntegrationBroker } from './integrationBroker';
 import * as integrations from './integrations';
@@ -61,10 +62,13 @@ import { validateBaseUrl, buildAuthHeaders, resolveUpstreamUrl, secretRefFor, IN
 import { RosterStore } from './roster';
 import { buildWorkerLaunch } from './workerLaunch';
 import { ControlRegistry } from './control';
-import { fetchHireManifest, readHireManifestFile } from './hire';
+import { WorkerWakeWatchdog, type WorkerWakeFacts } from './workerWake';
+import { inboxNudgeText } from '../shared/hiveNudge';
+import { fetchHireManifest, readHireManifestFiles } from './hire';
 import { parseHireDeepLink, type HireManifest } from '../shared/hire';
 import { ClosingTimeController } from './closingTime';
 import {
+  argsWithAutoModeFlag,
   inferAgentProvider,
   isClaudeProvider,
   nonInteractiveEnvForProvider,
@@ -241,7 +245,10 @@ const control = new ControlRegistry();
 // lets the transcript fallback find an agent's cwd from the hive registry.
 const telemetry = new TelemetryCollector({
   emit: (channel, payload) => { try { liveWebContents()?.send(channel, payload); } catch { /* window tore down */ } },
-  resolveCwd: (agentId) => hive.registry().agents[agentId]?.cwd ?? null
+  resolveCwd: (agentId) => hive.registry().agents[agentId]?.cwd ?? null,
+  // D11: scopes the transcript fallback to this agent's own session instead of
+  // summing every transcript in a (routinely shared) cwd.
+  resolveSessionId: (agentId) => hive.lastSession(agentId)
 });
 // Usage provider (Seam 1) — the INTEGRATION swap: Oscar's telemetry collector (#7)
 // IS the provider, replacing Lane A's interim StubUsageProvider. Same
@@ -261,13 +268,39 @@ const breaker = new CircuitBreaker(() => {
 // heartbeat mission is disabled (it ships off).
 let fleetTimer: ReturnType<typeof setInterval> | null = null;
 let breakerBeatTimer: ReturnType<typeof setInterval> | null = null;
-let inboxWakeTimer: ReturnType<typeof setInterval> | null = null;
 // Feed the breaker's api_error-storm trip from Oscar's OTel api_error spans —
 // Jim's one breaker input with no on-branch source (telemetry.onApiError seam).
 telemetry.onApiError((agentId) => breaker.recordError(agentId));
+// Shared roster on disk — created early so HookServer can re-read standing goals
+// on every UserPromptSubmit (Edit Agent saves land here via persistAgents).
+const roster = new RosterStore(() => readConfig().harnessHome);
+function standingGoalFromRoster(agentId: string): string | null {
+  const snap = roster.read();
+  if (!snap || !Array.isArray(snap.agents)) return null;
+  for (const entry of snap.agents) {
+    if (!entry || typeof entry !== 'object') continue;
+    const a = entry as { id?: unknown; goal?: unknown };
+    if (a.id !== agentId) continue;
+    return typeof a.goal === 'string' && a.goal.trim() ? a.goal.trim() : null;
+  }
+  return null;
+}
+// Worker inbox-wake watchdog (#151): finds idle workers with undrained inbox mail
+// and types the same guarded nudge the renderer would have (so a throttled
+// background window can't leave a worker parked on an unread inbox forever).
+// HookServer feeds it the hook stream so a permission/HITL prompt blocks nudges.
+const workerWake = new WorkerWakeWatchdog();
 // HookServer needs BOTH: Oscar's control registry (HITL pause/gate/steer/halt via
 // hook returns) AND Jim's breaker (feed recordToolUse on each PostToolUse).
-const hookServer = new HookServer(hive, () => liveWebContents(), () => readConfig(), control, breaker);
+const hookServer = new HookServer(
+  hive,
+  () => liveWebContents(),
+  () => readConfig(),
+  control,
+  breaker,
+  standingGoalFromRoster,
+  (agentId, event, message) => workerWake.noteHook(agentId, event, message)
+);
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
   () => { const c = readConfig(); return { enabled: c.semanticMemory !== false, model: c.embeddingModel ?? 'minilm' }; }
@@ -411,12 +444,10 @@ function teardownPty(id: string): void {
   const agentId = ptyToAgent.get(id);
   if (agentId) {
     ptyToAgent.delete(id);
+    // Drop watchdog state so a dead agent can't get nudged or leak its grace.
+    try { workerWake.forget(agentId, id); } catch { /* best-effort */ }
     // Drop breaker state so a dead agent can't leak/zombie a tripped level.
     try { breaker.forget(agentId); } catch { /* best-effort */ }
-    // Drop per-agent hook state (turn activity, context gauge, transcript path)
-    // so the maps track the floor rather than growing forever, and a respawn
-    // reusing this id starts from "no hook events yet".
-    try { hookServer.forget(agentId); } catch { /* best-effort */ }
     // W1 — kill this agent's proxy-bridge sidecar (qwen), if any, so a dead
     // PTY never leaves an orphan loopback listener. No-op for non-proxy agents.
     try { hive.stopProxyBridge(agentId); } catch (e) { console.error('[hive] stopProxyBridge failed:', e); }
@@ -631,7 +662,12 @@ function syncMissions(): void {
   clearMissionTimers();
   const missions = readConfig().missions ?? [];
   for (const m of missions) {
-    if (!m.enabled || !(m.intervalMs > 0)) continue;
+    if (!m.enabled) continue;
+    // A weekly mission (day-of-week + time) is armed below and does NOT need an
+    // interval, so the interval guard has to come after that branch — it used to
+    // be folded into the line above and would have rejected every one of them.
+    const weekly = m.kind === 'heartbeat' ? null : normalizeWeekly(m.weekly);
+    if (!weekly && !(m.intervalMs > 0)) continue;
     // Heartbeat (Lane A #1) opts out of the fixed setInterval and self-reschedules
     // with an adaptive cadence. Registered into the same missionTimers map so
     // clearMissionTimers() tears it down identically on quit/reset.
@@ -670,11 +706,33 @@ function syncMissions(): void {
         console.error('[scheduler] mission', m.id, e);
       }
     };
+    const entry: MissionTimer = {};
+    if (weekly) {
+      // Weekly self-reschedules: there is no steady interval to settle into,
+      // because the gap between two slots varies (Fri to Mon is not Mon to Wed,
+      // and the week the clocks change is not 168 hours long).
+      //
+      // `justFired` is a spin guard, not a nicety. weeklyDelayMs returns 0 for a
+      // slot that was missed and not yet run, and it learns "already run" from
+      // the persisted lastFiredAt — so if fire()'s writeConfig ever failed, the
+      // next computation would return 0 again, forever. Passing `now` as the
+      // last-fired floor after a fire makes the catch-up branch unreachable, so
+      // the worst case is a lost stamp rather than a hot loop.
+      const rearm = (justFired: boolean): void => {
+        const now = Date.now();
+        const persisted = (readConfig().missions ?? []).find((x) => x.id === m.id)?.lastFiredAt ?? 0;
+        const delay = weeklyDelayMs(weekly, now, justFired ? Math.max(persisted, now) : persisted);
+        if (delay === null) return;
+        entry.timeout = setTimeout(() => { fire(); rearm(true); }, delay);
+      };
+      rearm(false);
+      missionTimers.set(m.id, entry);
+      continue;
+    }
     // Honor lastFiredAt so a partially-elapsed interval is not restarted from
     // zero on reboot or when an unrelated mission is edited: wait only the time
     // remaining until the next due fire, then settle into a steady interval.
     const remaining = Math.max(0, m.intervalMs - (Date.now() - (m.lastFiredAt ?? 0)));
-    const entry: MissionTimer = {};
     entry.timeout = setTimeout(() => {
       fire();
       entry.interval = setInterval(fire, m.intervalMs);
@@ -1129,35 +1187,10 @@ function runBreakerBeat(progressWindowMs: number): void {
   }
 }
 
-/** Workers' second wake engine (#151, decision logic in src/main/inboxWake.ts).
- *  Detection runs HERE because main's timers survive everything the renderer's
- *  don't (reloads, wedged store state, a lost in-memory queue); delivery stays
- *  in the renderer so every existing typing guard keeps holding. Mirrors what
- *  reengageGod already does for the orchestrator. */
-const inboxWakeState: InboxWakeState = new Map();
-function runInboxWakeBeat(): void {
-  if (!hive.enabled()) return;
-  const reg = hive.registry();
-  const fires = inboxWakeTick(
-    {
-      agents: reg.agents,
-      godId: reg.godId,
-      ptyFor: ptyForAgent,
-      hookIdleFor: (id) => hookServer.hookIdleFor(id),
-      idleFor: (ptyId) => ptyManager.idleFor(ptyId),
-      inboxIds: (id) => hive.inbox(id).map((m) => m.id)
-    },
-    inboxWakeState,
-    Date.now()
-  );
-  for (const f of fires) {
-    console.log(
-      `[inbox-wake] ${f.agentId}: ${f.count} undrained message(s), idle ` +
-      `${Math.round(f.idleMs / 1000)}s (${f.idleSource}) — re-firing wake`
-    );
-    try { liveWebContents()?.send('hive:inboxWake', f); } catch { /* window torn down */ }
-  }
-}
+/** Lifetime spend, folded from cost-ledger.jsonl. `telemetry`'s usd counter is
+ *  cumulative-since-process-start and restarts at ~0 on every app restart, so
+ *  it cannot answer "what has this agent cost us". See costLifetime.ts. */
+const costTotals = new CostLedgerTotals();
 
 /** Build + write the live fleet snapshot Michael reads (`<hive>/fleet.json`).
  *  Always-on (independent of the heartbeat) since `claude agents` can't see the
@@ -1169,12 +1202,19 @@ function writeFleetSnapshot(): void {
     const snap = telemetry.snapshot();
     const usageById = new Map(snap.usage.map((u) => [u.agentId, u]));
     const now = Date.now();
+    // Async + incremental; returns immediately and never throws into the timer.
+    const hiveRoot = hive.root();
+    if (hiveRoot) void costTotals.refresh(join(hiveRoot, 'cost-ledger.jsonl'));
     const agents = Object.entries(reg.agents)
       .filter(([, a]) => !a.archived)
       .map(([id, a]) => {
         const u = usageById.get(id);
         const spans = snap.spans[id] ?? [];
         const tokens = u ? u.input + u.output + u.cacheRead + u.cacheCreation : 0;
+        // `usd` is LIFETIME (reset-corrected). Until the first fold completes we
+        // fall back to the session figure rather than publishing a cold $0.
+        const lifetime = costTotals.usdFor(id);
+        const sessionUsd = u ? Number(u.usd.toFixed(4)) : 0;
         return {
           id,
           name: a.name,
@@ -1183,10 +1223,12 @@ function writeFleetSnapshot(): void {
           isGod: !!a.isGod,
           breaker: breaker.levelFor(id),
           tokens,
-          usd: u ? Number(u.usd.toFixed(4)) : 0,
+          usd: lifetime === null ? sessionUsd : Number(lifetime.toFixed(4)),
+          sessionUsd,
           lastTool: spans.length ? spans[spans.length - 1].tool : null,
           lastActiveSecAgo: u ? Math.round((now - u.ts) / 1000) : null,
-          inboxBacklog: hive.inboxBacklog(id)
+          inboxBacklog: hive.inboxBacklog(id),
+          onHold: !!a.onHold
         };
       });
     hive.writeFleetSnapshot({ ts: now, agents });
@@ -1733,8 +1775,6 @@ function dispatchWebhookWork(arg: {
   origin: 'webhook' | 'org';
 }): boolean {
   try {
-    const ledger = hive.tasks() as { tasks?: HiveTask[] };
-    const existing = Array.isArray(ledger?.tasks) ? ledger.tasks : [];
     const card: HiveTask = {
       id: arg.taskId,
       title: arg.title,
@@ -1745,7 +1785,11 @@ function dispatchWebhookWork(arg: {
       createdAt: new Date().toISOString(),
       ...(arg.tokenHash ? { webhook: { tokenHash: arg.tokenHash } } : {})
     };
-    hive.writeTasks([...existing, card]);
+    // addTask appends against the latest on-disk ledger and is idempotent by task
+    // id, so a concurrent card writer (Slack, god, voice, another webhook) can't
+    // have its card lost to our stale whole-ledger overwrite. (writeTasks(...existing)
+    // recreated exactly that race.) A fresh taskId never collides, so this always adds.
+    hive.addTask(card);
   } catch (e) {
     console.error('[webhook] could not create task card:', e instanceof Error ? e.message : e);
     return false;
@@ -2133,15 +2177,23 @@ ipcMain.handle('hire:drainPending', () => {
   return out;
 });
 
-// IPC: "import hire…" file picker in the Add-Agent modal.
+// IPC: "import hires…" file picker in the Add-Agent modal. Every selected file
+// is validated independently; valid neighbours survive an invalid manifest.
 ipcMain.handle('hire:openFile', async () => {
   const res = await dialog.showOpenDialog({
-    title: 'Import a hire manifest',
+    title: 'Import hire manifests',
     filters: [{ name: 'Hire manifest', extensions: ['json'] }],
-    properties: ['openFile']
+    properties: ['openFile', 'multiSelections']
   });
-  if (res.canceled || res.filePaths.length === 0) return { ok: false, error: 'cancelled' };
-  return readHireManifestFile(res.filePaths[0]);
+  if (res.canceled || res.filePaths.length === 0) {
+    return { ok: false, manifests: [], errors: [], error: 'cancelled' };
+  }
+  const batch = readHireManifestFiles(res.filePaths);
+  return {
+    ok: batch.manifests.length > 0,
+    ...batch,
+    error: batch.manifests.length === 0 ? 'no valid hire manifests selected' : undefined
+  };
 });
 
 /**
@@ -2173,7 +2225,9 @@ function createWindow(opts: { floor?: boolean } = {}): BrowserWindow {
     show: false,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
+      // Keep Chromium's OS renderer sandbox active; privileged work stays behind
+      // the narrow contextBridge/IPC surface owned by the main process.
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
       // The renderer runs the hive's heartbeat loops (inbox nudge, message
@@ -2246,8 +2300,14 @@ function createWindow(opts: { floor?: boolean } = {}): BrowserWindow {
 
   win.once('ready-to-show', () => win.show());
 
+  // Never opens a window; hands the URL to the OS browser instead.
+  //
+  // Scheme-checked, because this is now reachable from AUTHOR-CONTROLLED markup:
+  // a release drop's iframe has `allow-popups`, so a target="_blank" link in a
+  // release body arrives here. http(s) only — an unguarded openExternal will
+  // happily launch file://, or a registered custom scheme, on the user's machine.
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
 
@@ -2628,7 +2688,20 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
   // in the command string the renderer already built.
   if (opts.hive && claudeProvider) {
     const cfg = readConfig();
-    const args = opts.args ?? [];
+    // Permission posture (D9): only a GUI hire (Add Agent) builds its command
+    // through buildSpawnCommand, which bakes autoMode's bypass flag into the
+    // command STRING before this function ever sees it. A main-only spawn (the
+    // ephemeral-worker watcher, a voice hire) skips that step entirely, so it
+    // previously reached here with neither the flag nor any equivalent — every
+    // other Claude spawn path got the user's autoMode posture and this one
+    // didn't. argsWithAutoModeFlag is idempotent (a GUI spawn's args already has
+    // the flag, so this is a no-op for it) and is the SAME check spawnAgentCore
+    // already applies for opencode/crush et al a few lines below via
+    // HIVE_AUTO_APPROVE — one global toggle, one posture, every spawn path.
+    // Confirmed live: a worker spawned without this flag deadlocked — a
+    // cross-session message to it came back "held for the recipient user's
+    // approval" with no surface for anyone to ever grant that approval.
+    const args = argsWithAutoModeFlag(opts.args ?? [], cfg.autoMode, provider);
     // Model precedence: an explicit per-agent --model (from the renderer) wins;
     // else the user's global defaultModel; else the role-based default tier. The
     // GOD is special-cased: it has its own engine config (godProvider/godModel), so
@@ -2734,7 +2807,12 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
   }
   // Remember which agent owns this PTY so closing the tab can archive it. A
   // live terminal means active — ensureAgent above already cleared `archived`.
-  if (opts.hive?.id) ptyToAgent.set(opts.id, opts.hive.id);
+  if (opts.hive?.id) {
+    ptyToAgent.set(opts.id, opts.hive.id);
+    // Worker inbox-wake watchdog (#151): boot grace starts at spawn so the
+    // initial orientation prompt is never mistaken for an idle agent.
+    workerWake.noteSpawn(opts.id);
+  }
   // Pre-accept Claude Code's bypass-mode warning + folder-trust dialog so the
   // agent (spawned with --permission-mode bypassPermissions) doesn't stall on an
   // interactive prompt it can't answer and exit code 1. Best-effort, never blocks.
@@ -2987,12 +3065,19 @@ ipcMain.handle('config:update', (_evt, patch: Partial<HarnessConfig>) => {
   const next = writeConfig(patch);
   // Live opt-in/out from Settings → Privacy (TELEMETRY.md).
   if (typeof patch?.telemetryEnabled === 'boolean') analytics.setEnabled(patch.telemetryEnabled);
+  // Keep the hive's mirror of the spawn gate current. The queue itself reads
+  // config per tick so it gates immediately; this is for the PROMPT, which is
+  // built per spawn, so flipping the toggle reaches god the next time he starts.
+  if (typeof patch?.orchestratorMaySpawn === 'boolean') hive.setOrchestratorMaySpawn(patch.orchestratorMaySpawn);
   if (!hiveWasEnabled && hive.enabled()) {
     console.log('[hive] harnessHome configured — bootstrapping hive services');
     try { bootstrapHiveServices(); } catch (e) { console.error('[hive] bootstrap after onboarding:', e); }
   }
   return next;
 });
+ipcMain.handle('config:setAgentTokenCap', (_evt, agentId: unknown, tokenCap: unknown) =>
+  setAgentTokenCap(agentId, tokenCap)
+);
 ipcMain.handle('config:ensureHome', (_evt, path: unknown) => {
   if (typeof path !== 'string' || path.length === 0) return { ok: false, error: 'invalid path' };
   return ensureHarnessHome(path);
@@ -3109,6 +3194,32 @@ ipcMain.handle('fs:statAbs', (_evt, p: unknown) => {
   return statAbs(p);
 });
 
+/** Reveal a path in the OS file browser — Finder, Explorer, or whatever the
+ *  Linux desktop registers. Backs ⌘-click on a terminal path we cannot open
+ *  ourselves (an image, an archive, an unknown extension).
+ *
+ *  `showItemInFolder`, NEVER `shell.openPath`, for a file. The path arrives
+ *  from agent output, and openPath hands an arbitrary file to its default
+ *  application: a printed `installer.dmg` or `.desktop` would be one click from
+ *  executing. Revealing only ever opens a file browser, so the worst an agent
+ *  can achieve by printing a path is a window at a folder the user could
+ *  already open themselves.
+ *
+ *  openPath IS used for a directory, and only after statAbs has confirmed it is
+ *  one — a directory has no default application to launch, so the execution
+ *  argument above does not apply, and revealing a folder inside its parent is
+ *  not what "open this folder" means to anyone. */
+ipcMain.handle('fs:revealPath', async (_evt, p: unknown) => {
+  if (typeof p !== 'string' || !p.length || p.length > 4096 || p.includes('\0')) {
+    return { ok: false, error: 'bad request' };
+  }
+  const st = await statAbs(p);
+  if (!st.exists) return { ok: false, error: 'not found' };
+  if (st.isFile) { shell.showItemInFolder(st.path); return { ok: true }; }
+  const err = await shell.openPath(st.path);
+  return err ? { ok: false, error: err } : { ok: true };
+});
+
 // ─── IPC: git ───────────────────────────────────────────────────────────────
 ipcMain.handle('git:isRepo', (_evt, cwd: unknown) => {
   if (typeof cwd !== 'string') return false;
@@ -3197,13 +3308,25 @@ ipcMain.handle('git:checkout', async (_evt, cwd: unknown, ref: unknown, detach: 
 // IPC could resolve, so the read is `ipcMain.on` + `returnValue` — one blocking
 // round trip at boot, in exchange for the roster being correct on first paint
 // instead of flashing an empty floor and then filling in.
-const roster = new RosterStore(() => readConfig().harnessHome);
+// (`roster` itself is constructed earlier so HookServer can read standing goals.)
 ipcMain.on('roster:readSync', (evt) => { evt.returnValue = roster.read(); });
 ipcMain.handle('roster:read', () => roster.read());
 ipcMain.handle('roster:write', (_evt, snap: unknown) => roster.write(snap));
 
 // ─── IPC: hive (multi-agent coordination) ───────────────────────────────────
 ipcMain.handle('hive:registry', () => hive.registry());
+ipcMain.handle('hive:renameAgent', (_evt, id: unknown, name: unknown) => {
+  if (typeof id !== 'string' || typeof name !== 'string') {
+    return { ok: false, error: 'Invalid rename request' };
+  }
+  return hive.renameAgent(id, name);
+});
+ipcMain.handle('hive:setAgentHold', (_evt, id: unknown, hold: unknown) => {
+  if (typeof id !== 'string' || typeof hold !== 'boolean') {
+    return { ok: false, error: 'Invalid hold request' };
+  }
+  return hive.setAgentHold(id, hold);
+});
 ipcMain.handle('hive:board', () => hive.board());
 ipcMain.handle('hive:tasks', () => hive.tasks());
 ipcMain.handle('hive:log', (_evt, n: unknown) => hive.logTail(typeof n === 'number' ? n : 200));
@@ -3245,6 +3368,12 @@ ipcMain.handle('hive:setArchived', (_evt, id: unknown, archived: unknown) => {
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   hive.setArchived(id, archived === true);
   return { ok: true };
+});
+ipcMain.handle('hive:patchAgentRole', (_evt, id: unknown, role: unknown) => {
+  if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
+  if (typeof role !== 'string') return { ok: false, error: 'invalid role' };
+  if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
+  return hive.patchAgentRole(id, role);
 });
 
 // ─── IPC: Settings hero payload (remote data, cached) ───────────────────────
@@ -3347,7 +3476,11 @@ ipcMain.handle('tools:status', (): ToolStatus[] => {
 });
 
 // ─── IPC: semantic memory (MemPalace CLI) ───────────────────────────────────
-ipcMain.handle('hive:memoryStatus', () => { memory.resetBinCache(); return memory.status(); });
+// refresh() = resetBinCache + an idempotent start(). The poll is the one thing
+// that reliably notices mempalace being installed after boot, so it is what arms
+// the mine loop that boot's start() had to skip — otherwise the pill reads
+// "getting ready" until the app is restarted.
+ipcMain.handle('hive:memoryStatus', () => memory.refresh());
 ipcMain.handle('hive:searchMemory', (_evt, query: unknown, wing: unknown) => {
   if (typeof query !== 'string' || !query.trim()) return { ok: false, output: '', error: 'empty query' };
   return memory.search(query, { wing: typeof wing === 'string' ? wing : undefined });
@@ -3490,7 +3623,11 @@ ipcMain.handle('app:confirmClose', () => {
   teardownAndQuit();
 });
 ipcMain.handle('app:cancelClose', () => {
-  // no-op — modal will close on the renderer side
+  // The modal closes on the renderer side. The one thing main owes anybody here
+  // is the truth about a restart-to-install: if this quit was one, it has just
+  // been called off, and whoever is waiting on it needs to hear that rather than
+  // sit disabled forever waiting for a process that is not going to die.
+  abortPendingRestart();
 });
 
 // Open a new floor (independent office window). Gated by the multiWindow flag
@@ -4255,6 +4392,17 @@ interface SpawnRequest {
   slack?: { channel: string; thread_ts: string };     // reply target + where failures surface
   isolate?: boolean;                                   // default true (fresh worktree)
   tokenCap?: number;                                   // optional per-worker token cap (advisory P1)
+  // Appearance on the office floor. Both optional and both validated renderer-side
+  // against the real cast and accent lists, so a bad value degrades to the default
+  // rather than breaking the card.
+  //
+  // Naming a worker after a cast member ALREADY gets you their avatar: the floor
+  // card infers it from the name. These two exist for the case that inference
+  // cannot express, an agent called something else that should still look like a
+  // particular character, and picking the accent instead of taking the one hashed
+  // from the worker id.
+  character?: string;
+  accent?: string;
 }
 
 /** Polling cadence — matches the hive router. */
@@ -4425,7 +4573,9 @@ async function processSpawnRequest(filePath: string): Promise<void> {
       cwd: res.worktreePath ?? cwd,
       command: launch.command,
       role: meta.role,
-      worktreePath: res.worktreePath
+      worktreePath: res.worktreePath,
+      character: typeof raw.character === 'string' ? raw.character : undefined,
+      accent: typeof raw.accent === 'string' ? raw.accent : undefined
     });
   } catch { /* window torn down */ }
 
@@ -4577,7 +4727,18 @@ async function ephemeralWorkerTick(): Promise<void> {
 
     // (2) Process new requests, honoring the concurrency cap (backpressure: leave
     //     the rest in the queue for a later tick).
-    const dir = spawnRequestsDir();
+    //
+    //     Gated on config.orchestratorMaySpawn (default OFF): letting the
+    //     orchestrator spin up agents unprompted is a SPEND decision, so the
+    //     operator opts in. The gate sits HERE, on intake, and not on the watcher
+    //     itself, because step (1) above owns the lifecycle of workers that are
+    //     already running — reaping, teardown, the Slack failure notice — and
+    //     turning the toggle off mid-flight must not strand them.
+    //
+    //     Declining also means declining to CONSUME. A request dropped in while
+    //     this is off stays in the queue and runs when it is turned on, rather
+    //     than being eaten and failed for a reason god never asked about.
+    const dir = readConfig().orchestratorMaySpawn ? spawnRequestsDir() : null;
     if (dir && existsSync(dir)) {
       let files: string[] = [];
       try { files = readdirSync(dir).filter(f => f.endsWith('.json')).sort(); } catch { /* dir vanished */ }
@@ -4666,12 +4827,13 @@ ipcMain.handle('workers:list', (): { live: WorkerSnapshot[]; preserved: Preserve
 });
 
 /** Manually stop a live ephemeral worker. Mirrors the done-release path: mark
- *  releasing, then kill + EXPLICIT teardownPty — kill() deletes the session
- *  synchronously, so node-pty's later onExit fails the identity guard and the
- *  global exit handler never runs; relying on it here left manually-stopped
- *  workers un-torn-down exactly like the release/reap paths. teardownPty runs
- *  the SAFETY-GATED worktree teardown (committed work is preserved, never
- *  force-discarded). Idempotent. */
+ *  releasing, then kill + teardownPty runs the SAFETY-GATED worktree teardown
+ *  (committed work is preserved, never force-discarded). Idempotent. teardownPty
+ *  is called explicitly (D10) rather than left to the PTY's natural exit: kill()
+ *  frees the manager's id slot synchronously, so by the time the process's real
+ *  exit arrives the exit-handler's stale-id guard already misreads it as a
+ *  reclaimed id and skips teardown — the worker would stay "live" in registry.json
+ *  and fleet.json forever after this call. */
 ipcMain.handle('workers:stop', (_evt, workerId: string): { ok: boolean; error?: string } => {
   if (typeof workerId !== 'string' || !workerId) return { ok: false, error: 'invalid worker id' };
   const rec = liveWorkers.get(workerId);
@@ -4690,6 +4852,30 @@ ipcMain.handle('workers:stop', (_evt, workerId: string): { ok: boolean; error?: 
 function bootstrapHiveServices(): void {
   if (!hive.enabled()) return;
   hive.ensureHive();
+  // Tell the hive what it is running inside, BEFORE anything spawns: the prompt
+  // builder reads this, so an agent spawned earlier would never learn it.
+  hive.setRuntimeInfo({ version: app.getVersion(), packaged: app.isPackaged, appPath: app.getAppPath() });
+  hive.setOrchestratorMaySpawn(readConfig().orchestratorMaySpawn === true);
+  // An app-start marker in the event log. log.jsonl had twelve event kinds and
+  // none of them meant "the app restarted", so a relaunch, and more importantly a
+  // switch between a packaged build and a local one, was invisible to every agent
+  // reading the feed. That gap cost a multi-hour investigation whose answer was
+  // exactly this: a local build inherits the launching shell's umask, a
+  // Finder-launched app does not.
+  hive.appendLog({
+    kind: 'app-start',
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    // WHICH bundle, not just which version. Version plus packaged is not enough
+    // to tell two builds apart: a stale copy in /Applications and a fresh one in
+    // dist/ can report the same version and both be packaged, and picking the
+    // wrong one by habit looks exactly like the new build being broken. Cost us
+    // twice before this line existed.
+    appPath: app.getAppPath(),
+    exePath: process.execPath,
+    electron: process.versions.electron,
+    platform: process.platform
+  });
   control.replaceAutoDeliveryPauses(readConfig().autoDeliveryPausedAgents ?? []);
   archiveOrphanedAgents(); // #57/#58: archive stale archived:false entries with no live PTY
   hive.startRouter();
@@ -4723,9 +4909,75 @@ function bootstrapHiveServices(): void {
   armAlwaysOnBeats();
 }
 
+/** Cadence of the worker inbox-wake watchdog (#151). Well under the renderer's
+ *  own nudge cooldown so a throttled window is caught within ~15s of a stall. */
+const WORKER_WAKE_POLL_MS = 15_000;
+let workerWakeTimer: ReturnType<typeof setInterval> | null = null;
+
+/** Type the renderer's guarded nudge into one worker's PTY — text first, Enter a
+ *  tick later (the exact submitToPty pattern: a single-chunk write would land the
+ *  "\r" inside the input box and never submit). Best-effort + never throws. */
+function nudgeWorker(ptyId: string, ids: string[] = []): void {
+  // Same text the renderer queues (#187's inboxNudgeText), so the two wake paths
+  // produce byte-identical nudges: the queue's one-pending rule recognises either
+  // via isInboxNudge, and a watchdog nudge names its ids so the agent can still
+  // tell "I filed this last turn" from "woken for nothing".
+  const wrote = ptyManager.write(ptyId, inboxNudgeText(ids));
+  if (!wrote.ok) { console.warn(`[worker-wake] write failed for ${ptyId}: ${wrote.error}`); return; }
+  setTimeout(() => {
+    try {
+      const submitted = ptyManager.write(ptyId, '\r');
+      if (!submitted.ok) console.warn(`[worker-wake] submit failed for ${ptyId}: ${submitted.error}`);
+    } catch (e) { console.error('[worker-wake] submit threw:', e); }
+  }, 140);
+}
+
+/** Main-process inbox-wake beat (issue #151, fix A): the renderer's idle nudge
+ *  (useHive.ts) is the only path that wakes a worker parked on an undrained
+ *  inbox — and it lives on a setInterval in the renderer, which a throttled or
+ *  occluded window stops honoring. This beat is the renderer-INDEPENDENT fallback:
+ *  it gathers live-worker facts (PTY quiescence, inbox depth, control flags) and
+ *  lets WorkerWakeWatchdog.decide apply the exact renderer guards (idle-only,
+ *  post-boot-grace, not paused/halted, no pending HITL, cooldown), then types the
+ *  same nudge the renderer would have. God is never a candidate (its heartbeat
+ *  path already re-engages it). */
+function runWorkerWakeBeat(): void {
+  if (!hive.enabled()) return;
+  const reg = hive.registry();
+  if (!reg?.agents || !reg.godId) return;
+  const now = Date.now();
+  const facts: WorkerWakeFacts[] = [];
+  for (const [agentId, a] of Object.entries(reg.agents)) {
+    if (agentId === reg.godId || a?.archived) continue;
+    const ptyId = ptyForAgent(agentId);
+    if (!ptyId) continue;
+    const snap = control.snapshot(agentId);
+    facts.push({
+      agentId,
+      isGod: agentId === reg.godId,
+      ptyId,
+      lastOutputAt: ptyManager.lastOutputAt(ptyId) ?? 0,
+      inboxCount: hive.inbox(agentId).length,
+      autoDeliveryPaused: snap.autoDeliveryPaused,
+      paused: snap.paused,
+      halted: snap.halted
+    });
+  }
+  for (const agentId of workerWake.decide(facts, now)) {
+    const ptyId = ptyForAgent(agentId);
+    if (!ptyId) continue;
+    // Re-read at delivery time, not from the facts snapshot: the agent may have
+    // drained the mail during the beat, and a nudge naming ids it already filed
+    // is the exact staleness #187 exists to stop.
+    const ids = hive.inbox(agentId).map((m) => m.id).filter(Boolean);
+    if (!ids.length) { console.log(`[worker-wake] ${agentId} drained before delivery, skipping`); continue; }
+    console.log(`[worker-wake] nudging ${agentId} on ${ptyId} (${ids.length} pending)`);
+    nudgeWorker(ptyId, ids);
+  }
+}
+
 /** (Re)arm the always-on beats (decoupled from the optional heartbeat): the live
- *  fleet snapshot Michael reads (~8s) + the breaker/cost-ledger beat (~30s) +
- *  the worker inbox-wake watchdog (~60s, #151).
+ *  fleet snapshot Michael reads (~8s) + the breaker/cost-ledger beat (~30s).
  *  Guarded (clear-then-set) so a re-bootstrap (changeHome recovery) OR a
  *  powerMonitor resume can't stack duplicate timers — these are setInterval
  *  handles that freeze during true system sleep and must be re-armed on wake. */
@@ -4735,8 +4987,9 @@ function armAlwaysOnBeats(): void {
   fleetTimer = setInterval(writeFleetSnapshot, 8_000);
   if (breakerBeatTimer) clearInterval(breakerBeatTimer);
   breakerBeatTimer = setInterval(() => { try { runBreakerBeat(300_000); } catch (e) { console.error('[breaker beat]', e); } }, 30_000);
-  if (inboxWakeTimer) clearInterval(inboxWakeTimer);
-  inboxWakeTimer = setInterval(() => { try { runInboxWakeBeat(); } catch (e) { console.error('[inbox-wake]', e); } }, 60_000);
+  if (workerWakeTimer) clearInterval(workerWakeTimer);
+  workerWakeTimer = setInterval(() => { try { runWorkerWakeBeat(); } catch (e) { console.error('[worker-wake beat]', e); } }, WORKER_WAKE_POLL_MS);
+  runWorkerWakeBeat(); // catch-up on arm — power-resume re-arms and drains the backlog
 }
 
 /** Wall-clock instant we last observed the machine suspend or lock, so a resume
@@ -4910,20 +5163,33 @@ app.on('before-quit', (e) => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
-    ptyManager.killAll();
-    app.quit();
+    // Full teardown, not a bare killAll: this path must also stop the proxy
+    // sidecars and helper servers — on Windows a child is NOT killed when its
+    // parent exits, so anything skipped here outlives the app.
+    teardownAndQuit();
   }
 });
 
 // Final analytics flush (session_ended + drain the send queue), bounded so a
 // hung network can never wedge quit: preventDefault ONCE, race the flush
-// against a short timeout, then re-enter quit with the latch set.
+// against a short timeout, then exit hard.
+//
+// finish MUST be app.exit(), not a re-entrant app.quit(): when the quit was
+// initiated while a window was still open (the "kill all & quit" confirm path
+// calls teardownAndQuit → app.quit() and the window closes DURING that quit),
+// Electron is left with its internal is-quitting state set after this
+// preventDefault, and the later app.quit() is silently a no-op — no before-quit,
+// no will-quit, no quit; the main process idles forever with zero windows. On
+// Windows that stranded the whole Electron process group (main + GPU + network
+// service) after every agents-running quit. By this point teardown has already
+// run and the flush has finished or timed out, so an unconditional exit is
+// exactly what's left to do.
 let analyticsFlushed = false;
 app.on('will-quit', (e) => {
   if (analyticsFlushed) return;
   analyticsFlushed = true;
   e.preventDefault();
-  const finish = (): void => app.quit();
+  const finish = (): void => app.exit(0);
   Promise.race([
     analytics.endSession(),
     new Promise<void>((r) => setTimeout(r, 1200))
