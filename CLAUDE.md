@@ -1,3 +1,10 @@
+# OpenWolf
+
+@.wolf/OPENWOLF.md
+
+This project uses OpenWolf for context management. The imported protocol above applies every session.
+
+
 # CLAUDE.md — munder-difflin (harness Electron "The Office")
 
 App Electron (electron-vite + React + better-sqlite3 + node-pty) que orquesta agentes Claude Code como "empleados" en una oficina virtual. God = Michael (proxy del humano); workers = empleados contratados.
