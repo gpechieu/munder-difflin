@@ -45,3 +45,28 @@
 - `ea9e6636` chore: roster.ts alineado con upstream
 - `ead93a4a` chore: package-lock con i18next (quedó fuera del merge por orden de staging)
 - (docs) handoff 015 + CLAUDE.md — commit siguiente a este handoff
+
+---
+
+## ➕ SEGUNDA PARTE (misma sesión, 2026-09-04 17:30–17:45) — LAS 3 DECISIONES APLICADAS
+
+Decisión del usuario: (1) opción B re-embed, (2) cap a 0, (3) "decide la opción correcta, no inventes" → verificado con git y cerrados.
+
+### 1. Memoria semántica REPARADA (re-embed con embeddinggemma)
+- Backup previo: `<harnessHome>/palace-backup-20260904-173337` (cp -R). mempalace además archivó el original en `palace.pre-rebuild-20260904-173337` (`--archive-existing` implícito en `rebuild-index`). Ambas copias = 12M; se pueden borrar cuando el usuario quiera.
+- Comando (app CERRADA, env `MEMPALACE_PALACE_PATH=<harnessHome>/palace MEMPALACE_EMBEDDING_MODEL=embeddinggemma MEMPALACE_EMBEDDING_DEVICE=cpu`): dry-run (776 filas) → `mempalace --palace <harnessHome>/palace repair rebuild-index --yes` → 583 drawers + 193 closets re-embebidos, FTS5 rebuilt, VACUUM, quick_check clean, exit 0, 1:20 min (676% CPU).
+- HECHO: el palace reconstruido ya NO tiene `mempalace_embedder.json` (mempalace 3.7.1 no lo recrea; no es error). `mempalace status` con embeddinggemma responde (583 drawers, 7 wings).
+- Verificación real: boot de la app → 0 líneas `[memory] mine ... exited 1` en 3+ min (el primer mine corre en el tick 0 del boot; el éxito es silencioso por diseño, `memory.ts` solo loggea `code !== 0`). Mine manual `mempalace mine <hive>/agents/god --wing god --agent god` → exit 0.
+- Buglog `mempalace-embedding-model-mismatch` → fix aplicado.
+
+### 2. `defaultWorkerTokenCap: 150000 → 0`
+- `~/Library/Application Support/munder-difflin/config.json`, con la app cerrada; backup `config.json.bak-20260904-173345` en la misma carpeta. Verificado en relectura.
+
+### 3. PRs #161 y #162 CERRADOS por nosotros con nota (17:36Z)
+- Evidencia antes de tocar nada: `git merge-base --is-ancestor` YES para `a3b75f6`, `44bfb19` (cubren #161: `createAnsiStripper` con carry acotado en `src/renderer/src/components/ansiText.ts`) y `68cbc25c` (cubre #162: `src/main/workerWake.ts`, cita #151). Por qué cerrar nosotros y no esperar: el contenido está shipped desde v0.4.5, el agente del maintainer pidió decisión el 1-sep sin respuesta, y son PRs propios (branches `fix/bubble-ansi-garble` y `fix/worker-inbox-wake-watchdog` siguen intactos en el fork).
+- Comentarios: https://github.com/chaitanyagiri/munder-difflin/pull/161#issuecomment-5542823241 y https://github.com/chaitanyagiri/munder-difflin/pull/162#issuecomment-5542823836.
+- **Resultado: 0 PRs nuestros abiertos.** Balance final de los 8: 4 merged (#157 #158 #159 #178), 2 cerrados como shipped por el maintainer (#156 #160), 2 cerrados por nosotros como cubiertos (#161 #162).
+
+### Estado final
+- App: FUNCIONANDO CORRECTAMENTE (boot v0.4.6, broker+telemetry, agentes restaurados, miners OK). Parada limpiamente al terminar.
+- Sin pendientes de código ni de config. Próximo trabajo: aportar desde la base funcional (src/test = upstream).
