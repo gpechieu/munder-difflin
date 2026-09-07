@@ -7,7 +7,10 @@
 // TUI redraws its chrome without doing any work and the boot sequence itself is
 // output. Telemetry is the CLI's own evidence of a turn: mail older than
 // WORKER_WAKE_STALL_MS with no usage sample since it landed is a stalled
-// worker, and the nudge goes in whatever the terminal is printing.
+// worker, and the nudge goes in whatever the terminal is printing — and again
+// after each cooldown, even though its ids were already announced (#358's
+// edge trigger is for a worker that heard the announcement; a stalled one did
+// not).
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const loadTs = require('./load-ts.cjs');
@@ -29,7 +32,7 @@ function chatty(overrides = {}) {
     agentId: 'stanley',
     ptyId: 'pty-stanley',
     lastOutputAt: NOW - 1_000,
-    inboxCount: 1,
+    inboxIds: ['mail-1'],
     autoDeliveryPaused: false,
     paused: false,
     halted: false,
@@ -51,7 +54,7 @@ test('isStalledWorker: old mail with no activity since it landed', () => {
   assert.equal(isStalledWorker(chatty({ oldestMailAt: mailAt + 1, lastActivityAt: 0 }), NOW), false, 'younger than the stall window');
   assert.equal(isStalledWorker(chatty({ oldestMailAt: undefined, lastActivityAt: 0 }), NOW), false, 'unknown mail age → rule off (fail closed)');
   assert.equal(isStalledWorker(chatty({ oldestMailAt: 0, lastActivityAt: 0 }), NOW), false);
-  assert.equal(isStalledWorker(chatty({ oldestMailAt: mailAt, lastActivityAt: 0, inboxCount: 0 }), NOW), false, 'no mail, nothing to stall on');
+  assert.equal(isStalledWorker(chatty({ oldestMailAt: mailAt, lastActivityAt: 0, inboxIds: [] }), NOW), false, 'no mail, nothing to stall on');
 });
 
 test('a stalled worker is nudged even though its terminal is chatty (the 17-minute case)', () => {
@@ -65,6 +68,18 @@ test('a stalled worker that NEVER produced output is nudged too (boot never happ
   const w = watchdog();
   const f = chatty({ lastOutputAt: 0, oldestMailAt: NOW - 2 * 60_000, lastActivityAt: 0 });
   assert.deepEqual(w.decide([f], NOW), ['stanley']);
+});
+
+test('a stalled worker is nudged AGAIN after the cooldown although its mail ids were already announced', () => {
+  const w = watchdog();
+  const f = chatty({ oldestMailAt: NOW - 10 * 60_000, lastActivityAt: 0 });
+  assert.deepEqual(w.decide([f], NOW), ['stanley']);
+  assert.equal(w.explain(f, NOW + WORKER_WAKE_COOLDOWN_MS - 1), 'cooldown');
+  assert.deepEqual(w.decide([f], NOW + WORKER_WAKE_COOLDOWN_MS), ['stanley'], 'retries every cooldown until the mail drains');
+  // Once the CLI shows a turn after the mail, the edge trigger rules again:
+  // same ids, already announced → held, exactly as #358 intends.
+  const awake = chatty({ oldestMailAt: NOW - 10 * 60_000, lastActivityAt: NOW + WORKER_WAKE_COOLDOWN_MS + 5 });
+  assert.equal(w.explain(awake, NOW + 2 * WORKER_WAKE_COOLDOWN_MS + WORKER_WAKE_IDLE_MS + 10), 'announced');
 });
 
 test('a chatty worker with a turn since the mail landed is mid-turn, not stalled', () => {
@@ -86,7 +101,9 @@ test('facts without the new fields behave exactly as before (fail closed)', () =
   const w = watchdog();
   assert.equal(w.explain(chatty(), NOW), 'mid-turn');
   assert.equal(w.explain(chatty({ lastOutputAt: 0 }), NOW), 'booting');
-  assert.deepEqual(w.decide([chatty({ lastOutputAt: NOW - WORKER_WAKE_IDLE_MS - 1 })], NOW), ['stanley']);
+  const quiet = chatty({ lastOutputAt: NOW - WORKER_WAKE_IDLE_MS - 1 });
+  assert.deepEqual(w.decide([quiet], NOW), ['stanley']);
+  assert.equal(w.explain(quiet, NOW + WORKER_WAKE_COOLDOWN_MS + 1), 'announced', 'same mail is not re-announced (#358)');
 });
 
 test('the stall rule never overrides paused / halted / HITL / cooldown / boot grace', () => {
@@ -99,20 +116,16 @@ test('the stall rule never overrides paused / halted / HITL / cooldown / boot gr
   hitl.noteHook('stanley', 'Notification', 'Claude needs your permission to run Bash', NOW - WORKER_WAKE_HITL_REARM_MS + 1);
   assert.equal(hitl.explain(chatty(stalled), NOW), 'hitl');
 
-  const cooled = watchdog();
-  assert.deepEqual(cooled.decide([chatty(stalled)], NOW), ['stanley']);
-  assert.equal(cooled.explain(chatty(stalled), NOW + WORKER_WAKE_COOLDOWN_MS - 1), 'cooldown');
-  assert.deepEqual(cooled.decide([chatty(stalled)], NOW + WORKER_WAKE_COOLDOWN_MS), ['stanley'], 'retries every cooldown until the mail drains');
-
   const fresh = new WorkerWakeWatchdog();
   fresh.noteSpawn('pty-stanley', NOW - 10_000);
-  assert.equal(fresh.explain(chatty({ oldestMailAt: NOW - 10 * 60_000, lastActivityAt: 0 }), NOW), 'boot-grace');
+  assert.equal(fresh.explain(chatty(stalled), NOW), 'boot-grace');
 });
 
 test('explain names every hold so the beat can log why a worker starves', () => {
   const w = watchdog();
   assert.equal(w.explain(chatty({ isGod: true }), NOW), 'god');
-  assert.equal(w.explain(chatty({ inboxCount: 0 }), NOW), 'no-mail');
+  assert.equal(w.explain(chatty({ inboxIds: [] }), NOW), 'no-mail');
+  assert.equal(w.explain(chatty({ inboxIds: ['', 42] }), NOW), 'no-mail', 'junk ids do not count as mail');
   assert.equal(w.explain(chatty({ ptyId: undefined }), NOW), 'no-pty');
 });
 

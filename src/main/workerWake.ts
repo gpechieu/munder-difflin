@@ -9,9 +9,11 @@
  * because the main process re-engages it on its own heartbeat cadence.
  *
  * This watchdog is the worker-side counterpart: on a cadence it finds live
- * workers that are genuinely idle, have undrained inbox mail, are not paused /
- * not awaiting a human decision, and have not been nudged recently — then types
- * the same guarded nudge the renderer would have, directly into the PTY.
+ * workers that are genuinely idle, have newly arrived inbox mail, are not
+ * paused / not awaiting a human decision, and have not been nudged recently —
+ * then types the same guarded nudge the renderer would have, directly into the
+ * PTY. Message ids make this edge-triggered: unchanged undrained mail is never
+ * re-announced once a minute forever.
  *
  * Safety mirrors the renderer's guarded queue-drain (useHive.ts dispatch):
  *  - only a GENUINELY idle worker is nudged (no PTY output for IDLE_MS — the
@@ -47,10 +49,12 @@ export const WORKER_WAKE_HITL_REARM_MS = 5 * 60_000;
  *  still drawing, an occluded renderer that never typed one). PTY output cannot
  *  vouch for such a worker — a TUI redraws its chrome without doing any work,
  *  and the boot sequence itself is output — so past this age the quiet-output
- *  and never-output rules are bypassed and the nudge goes in regardless (still
- *  subject to paused/halted/HITL/cooldown). Observed live 2026-09-06: a worker
- *  sat 17 minutes on its work order with 0 tokens and no transcript until the
- *  human typed "read your inbox" by hand; this watchdog never fired. */
+ *  and never-output rules are bypassed, and so is the announced-ids edge trigger
+ *  (#358 is for a worker that HEARD the announcement; a stalled one did not),
+ *  still subject to paused/halted/HITL/boot-grace/cooldown. Observed live
+ *  2026-09-06: a worker sat 17 minutes on its work order with 0 tokens and no
+ *  transcript until the human typed "read your inbox" by hand; this watchdog
+ *  never fired. */
 export const WORKER_WAKE_STALL_MS = 90_000;
 /** Minimum age of pending mail before a held worker is reported in the log. */
 export const WORKER_WAKE_REPORT_MS = 60_000;
@@ -87,8 +91,8 @@ export interface WorkerWakeFacts {
   ptyId?: string;
   /** Timestamp of the PTY's last output (0 = never output). */
   lastOutputAt: number;
-  /** Count of undrained inbox messages (0 → nothing to wake for). */
-  inboxCount: number;
+  /** IDs of undrained inbox messages (empty → nothing to wake for). */
+  inboxIds: readonly string[];
   /** ControlRegistry snapshot flags. */
   autoDeliveryPaused: boolean;
   paused: boolean;
@@ -105,14 +109,19 @@ export interface WorkerWakeFacts {
 export type WorkerWakeHold =
   | 'god' | 'no-mail' | 'no-pty'
   | 'delivery-paused' | 'paused' | 'halted'
-  | 'booting' | 'mid-turn' | 'boot-grace' | 'hitl' | 'cooldown';
+  | 'booting' | 'mid-turn' | 'boot-grace' | 'hitl' | 'announced' | 'cooldown';
+
+/** The inbox ids that count as mail: non-empty strings only. */
+function liveInboxIds(f: WorkerWakeFacts): Set<string> {
+  return new Set(f.inboxIds.filter((id) => typeof id === 'string' && id.length > 0));
+}
 
 /** Mail has waited WORKER_WAKE_STALL_MS and the CLI has shown no session
  *  activity since it landed: whatever its terminal is printing, this worker is
  *  not working the mail. */
 export function isStalledWorker(f: WorkerWakeFacts, now = Date.now()): boolean {
   const mailAt = f.oldestMailAt ?? 0;
-  if (mailAt <= 0 || f.inboxCount <= 0) return false;
+  if (mailAt <= 0 || liveInboxIds(f).size === 0) return false;
   if (now - mailAt < WORKER_WAKE_STALL_MS) return false;
   return (f.lastActivityAt ?? 0) < mailAt;
 }
@@ -122,6 +131,9 @@ export class WorkerWakeWatchdog {
   private spawnedAt = new Map<string, number>();
   /** agentId → last nudge timestamp (cooldown). */
   private lastNudgeAt = new Map<string, number>();
+  /** agentId → inbox ids included in the last nudge. This turns the watchdog
+   *  into an edge trigger: a worker is nudged again only when a new id appears. */
+  private announcedInboxIds = new Map<string, Set<string>>();
   /** agentId → timestamp of the last needsHuman hook notification. */
   private lastHumanNeedsAt = new Map<string, number>();
 
@@ -139,6 +151,7 @@ export class WorkerWakeWatchdog {
   /** Forget per-agent state (e.g. the agent's PTY was closed). */
   forget(agentId: string, ptyId?: string): void {
     this.lastNudgeAt.delete(agentId);
+    this.announcedInboxIds.delete(agentId);
     this.lastHumanNeedsAt.delete(agentId);
     this.lastHoldReportAt.delete(agentId);
     if (ptyId) this.spawnedAt.delete(ptyId);
@@ -149,10 +162,12 @@ export class WorkerWakeWatchdog {
   /** Why this worker is held right now, or null when it should be nudged.
    *  The same checks decide() applies, in the same order, exposed so the beat
    *  can LOG why a worker with old pending mail is not being woken — the
-   *  watchdog's silence used to be indistinguishable from "nothing to do". */
+   *  watchdog's silence used to be indistinguishable from "nothing to do".
+   *  Pure: never touches the announcement / cooldown memory. */
   explain(f: WorkerWakeFacts, now = Date.now()): WorkerWakeHold | null {
+    const inboxIds = liveInboxIds(f);
+    if (inboxIds.size === 0) return 'no-mail';
     if (f.isGod) return 'god';
-    if (f.inboxCount <= 0) return 'no-mail';
     if (!f.ptyId) return 'no-pty';
     if (f.autoDeliveryPaused) return 'delivery-paused';
     if (f.paused) return 'paused';
@@ -164,6 +179,10 @@ export class WorkerWakeWatchdog {
     if (spawned > 0 && now - spawned < WORKER_WAKE_BOOT_GRACE_MS) return 'boot-grace';
     const lastHuman = this.lastHumanNeedsAt.get(f.agentId) ?? 0;
     if (lastHuman > 0 && now - lastHuman < WORKER_WAKE_HITL_REARM_MS) return 'hitl';
+    // Edge trigger (#358): mail already announced is not announced again — unless
+    // the worker is stalled, i.e. it demonstrably never acted on the announcement.
+    const announced = this.announcedInboxIds.get(f.agentId);
+    if (announced && !stalled && !Array.from(inboxIds).some((id) => !announced.has(id))) return 'announced';
     const lastNudge = this.lastNudgeAt.get(f.agentId) ?? 0;
     if (lastNudge > 0 && now - lastNudge < WORKER_WAKE_COOLDOWN_MS) return 'cooldown';
     return null;
@@ -172,8 +191,14 @@ export class WorkerWakeWatchdog {
   decide(facts: readonly WorkerWakeFacts[], now = Date.now()): string[] {
     const out: string[] = [];
     for (const f of facts) {
+      const inboxIds = liveInboxIds(f);
+      if (inboxIds.size === 0) {
+        this.announcedInboxIds.delete(f.agentId);
+        continue;
+      }
       if (this.explain(f, now) !== null) continue;
       this.lastNudgeAt.set(f.agentId, now);
+      this.announcedInboxIds.set(f.agentId, inboxIds);
       out.push(f.agentId);
     }
     return out;
@@ -191,7 +216,6 @@ export class WorkerWakeWatchdog {
     return true;
   }
 
-  /** Last time this worker was nudged (0 = never) — useful for diagnostics. */
   lastNudge(agentId: string): number {
     return this.lastNudgeAt.get(agentId) ?? 0;
   }
