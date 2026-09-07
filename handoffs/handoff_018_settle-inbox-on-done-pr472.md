@@ -35,3 +35,8 @@
 ## GIT
 - Commit del fix: `b165df55` (fork `fix/settle-inbox-on-done`, PR upstream #472).
 - Este handoff + CLAUDE.md: commit en `feature/god-workers-visibles-roster-guard` (hash en el mensaje final de sesión).
+
+## ACTUALIZACIÓN 21:55 — #472 integrado y oficina reiniciada
+- Con la app cerrada por el usuario: `git cherry-pick -x b165df55` sobre `feature/god-workers-visibles-roster-guard` → `8100771b` (limpio). Typecheck OK, suite **871/871**, push al fork.
+- Reinicio 21:48 sin errores; god restaurado (sesión `ced45bae`), OpenWolf `session-start` 19:48:15Z, keep-awake ON. Los 4 fixes (#454/#455/#463/#472) en producción.
+- Pendiente: reviews upstream de los 4 PRs; decisión del usuario sobre correo a agentes archivados (no cubierto por #472). Fin de sesión de pruebas.
