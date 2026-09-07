@@ -49,3 +49,21 @@
 ### PENDIENTE
 - FF a `feature/…` + reinicio (aviso del usuario). Hasta entonces, Holly y cualquier worker atascado se despiertan escribiendo "lee tu inbox y empieza la tarea" en su terminal.
 - Validar en vivo tras el reinicio: (a) `[queue-drain] … did not report UserPromptSubmit … keeping it queued` seguido de entrega confirmada en un spawn frío; (b) `[worker-wake] nudging` para un worker atascado ≥90s.
+
+---
+
+## PARTE 3 (09:45–10:45) — Reinicio con la integración; OpenWolf en god: validación empírica y arreglo
+
+### Reinicio con la integración (10:19)
+- `git merge --ff-only integrate/upstream-20260907` → `b9c82dc4`; relanzado; Michael y Holly restaurados con `--resume`. Holly recibió su nudge de arranque 2 s tras el spawn (transcript 09:22:50 tras su spawn 09:22:48 en el primer reinicio) y entregó la fase B a las 09:38. Meredith (spawn 09:39:12 → prompt 09:39:18), Creed y otros: ciclo completo sin intervención. Hueco menor anotado: un worker de god restaurado por auto-restore no entra en `liveWorkers`, así que no se libera al terminar (queda idle, sin coste).
+
+### OpenWolf en god — lo que Michael reportó vs. lo medido
+Michael instaló 12 hooks de OpenWolf en `hive/agents/god/.claude/settings.json` y lo declaró "validado". Validación empírica (sin inferencias), en orden:
+1. **Ese archivo no se carga nunca.** Claude Code solo lee `~/.claude/settings.json`, `<cwd>/.claude/settings.json` (+.local) y `--settings`. god: cwd = `<harnessHome>`, `--settings hive/agents/god/settings.json` (lo regenera el harness en cada spawn). Probado con 3 arranques `claude -p` (A cwd con settings: dispara; B settings en dir ajeno: NO; C --settings: dispara). Movido a `<harnessHome>/.claude/settings.json` (god-only: único agente con ese cwd; 19 workers en `hive/`).
+2. **Tras moverlo seguía sin ejecutarse.** Turno de god a las 10:32 con 2 Bash: `_heartbeat.json` (last_ok por hook) sin cambios. Reproducido en réplica interactiva con `node-pty` usando el archivo exacto: sin latido; con `touch` en el mismo sitio: dispara. Descartados con pruebas: esquema (eventos desconocidos toleran), timeout 5 s (hook 46 ms), PATH (node resoluble), trust (aceptado), flags de god (bypass, append-system-prompt, --settings con sandbox), --resume, cambio de hooks en mitad de sesión.
+3. **Causa raíz medida:** un hook `env > archivo` demuestra que Claude Code exporta `CLAUDE_PROJECT_DIR=<cwd>` (y `CLAUDECODE=1`) a cada hook. OpenWolf `getProjectDir()` prioriza esa variable → busca `<harnessHome>/.wolf` (inexistente) → exit 0 silencioso. Ejecutado a mano con la variable: 0 bytes, sin latido. Michael asumió la variable vacía porque solo la comprobó ejecutando los hooks a mano.
+4. **Arreglo (fiel a su diseño god-only):** los 12 comandos envueltos como `env -u CLAUDE_PROJECT_DIR node "<hook>"` en `<harnessHome>/.claude/settings.json`; `.wolf` sigue en `hive/agents/god/.wolf`. Réplica interactiva: latido `session-start` actualizado. Reinicio 10:42: `session-start.last_ok` = 10:42:30 (spawn de god 10:42:28) y archivo de sesión `37fd1350….json` creado. Bonus medido: la sesión anterior recargó el archivo en caliente (`user-prompt-submit` 10:41:45, `pre-bash` 10:42:12, `session-end` 10:42:12).
+5. `pre-read` registró 1 fallo a las 10:41:47 (TypeError en `files_read`): la recarga en caliente ejecutó `pre-read` sin archivo de sesión (sin `session-start` previo). Tras el reinicio funciona (manual: last_ok 10:43:06, fallos 0). Fragilidad de OpenWolf 2.5.1, no de la configuración.
+- Rollback: `rm <harnessHome>/.claude/settings.json && rm -rf hive/agents/god/.wolf`. Avisos a god en su inbox (reubicación y causa raíz) para que corrija su memoria; el hive git registra la eliminación de `agents/god/.claude/settings.json`.
+- Método reutilizable: `handoffs/tools` no lo incluye; ver cerebrum (arranques `-p` con hooks `touch`, réplica `node-pty` con cwd confiado, validar siempre con `_heartbeat.json`).
+- Pendiente de observación: governor de Bash (mode=replace, 2000 tokens) sobre salidas que god necesita íntegras (`fleet.json`, `openwolf report`); `openwolf report` con datos tras unas horas.
