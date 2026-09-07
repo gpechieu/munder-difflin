@@ -29,3 +29,23 @@
 
 ## GIT
 - PRs: #454 `798b7881` · #455 `540da4c6` (fork `fix/*`). Integración: `de1b5635` + este handoff (fork `integrate/upstream-20260907`). `evidence` branch: `6dc13b46`.
+
+---
+
+## PARTE 2 (09:00–09:40) — CAUSA RAÍZ del worker que no lee su work order (Holly) y 3er fix
+
+### HECHOS (todos observados en vivo, 2026-09-07 09:02–09:10)
+- `log.jsonl`: worker-holly spawn 09:02:10, work order entregado a su inbox (`delivered:["worker-holly"]`).
+- `fleet.json` a los 8 min: tokens 0, lastTool null, inboxBacklog 1. Sin transcript de su sesión. Proceso `claude` vivo.
+- Watchdog (v2, ya en la app): `[worker-wake] holding worker-holly: mid-turn (mail pending 69s, pty quiet 0s, last activity 63s ago)`. Dos lecciones: la TUI de Claude NUNCA calla (`pty quiet 0s` idle en el prompt) y la muestra de telemetría de arranque (0 tokens) contaba como actividad.
+- localStorage del renderer (LevelDB, UTF-16): `cth.messageQueues` = `{}` y worker-holly `status:"idle", action:"awaiting"` → el nudge de arranque SÍ se escribió al PTY, se dio por entregado y el CLI lo perdió. Sin reintento.
+- Código: `terminalReadyToReceive(claude)` = hasOutput && 400ms (banner, no cuadro de entrada); `deliverWithAcknowledgement` acusa al resolver la escritura; el poll de inbox marca los ids como avisados al encolar. Kevin (spawn 08:39:44 → prompt 08:39:51) ganó la carrera; Holly y Stanley4 la perdieron.
+
+### FIXES
+- **fix/prompt-delivery-ack** (`1308d35b`, worktree `../munder-difflin-pr-prompt-ack`, PR abierto hoy): `PromptAckTracker` + `deliverWithConfirmation` en `queueDelivery.ts`; el drain de `useHive.ts` confirma cada entrega con el hook `UserPromptSubmit` (claude/codex/gemini), timeout 10s, reintento con cooldown, tras 3 fallos acuse por escritura + warning; slash commands y proveedores sin hook mantienen la regla vieja. Tests `prompt-delivery-ack` (10; 9/10 rojos en main). 844/844.
+- **#455 v3** (`845dd0e6`): `activityEvidenceAt` = span de herramienta o muestra CON tokens. Tests 12; 846/846.
+- Integración `integrate/upstream-20260907` = upstream + #454 + #455 v3 + prompt-ack: typecheck ok, **867/867** (`b7566f50` + docs).
+
+### PENDIENTE
+- FF a `feature/…` + reinicio (aviso del usuario). Hasta entonces, Holly y cualquier worker atascado se despiertan escribiendo "lee tu inbox y empieza la tarea" en su terminal.
+- Validar en vivo tras el reinicio: (a) `[queue-drain] … did not report UserPromptSubmit … keeping it queued` seguido de entrega confirmada en un spawn frío; (b) `[worker-wake] nudging` para un worker atascado ≥90s.
